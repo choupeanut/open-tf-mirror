@@ -1,0 +1,35 @@
+[package]
+name = "open-tf-mirror"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["macros"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+http = "1"
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "http1", "http2", "service"] }
+parking_lot = "0.12"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal", "time"] }
+tokio-rustls = "0.26"
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
+tokio-test = "0.4"
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"

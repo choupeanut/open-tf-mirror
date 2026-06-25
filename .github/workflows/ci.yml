@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+  container:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: rust
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --tag open-tf-mirror:ci .
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: Lint chart
+        run: helm lint helm/hermitcrab
+
+      - name: Render chart with existing Argo CD values shape
+        run: |
+          helm template hermitcrab helm/hermitcrab \
+            --namespace hermitcrab \
+            --set fullnameOverride=hermitcrab \
+            --set hermitcrab.image.repository=ghcr.io/choupeanut/open-tf-mirror \
+            --set hermitcrab.image.tag=0.1.0 \
+            --set hermitcrab.replicas=2 \
+            --set hermitcrab.args[0]=--log-debug \
+            --set hermitcrab.args[1]=--log-verbosity=4 \
+            --set hermitcrab.args[2]=--conn-burst=500 \
+            --set hermitcrab.args[3]=--conn-qps=500 \
+            --set hermitcrab.args[4]=--tls-cert-file=/etc/hermitcrab/ssl/tls.crt \
+            --set hermitcrab.args[5]=--tls-private-key-file=/etc/hermitcrab/ssl/tls.key \
+            --set hermitcrab.tls.enabled=true \
+            --set hermitcrab.tls.domainName=it-will-be-ignored.example.com \
+            --set hermitcrab.tls.secretName=hermitcrab-tls-secret \
+            --set hermitcrab.pvc.size=20Gi \
+            --set hermitcrab.pvc.storageClass=hyperdisk-balanced \
+            >/tmp/hermitcrab-rendered.yaml
+          grep -q 'name: hermitcrab-hermitcrab$' /tmp/hermitcrab-rendered.yaml
+          grep -q 'name: hermitcrab-hermitcrab-headless$' /tmp/hermitcrab-rendered.yaml
+          grep -q -- '--tls-private-key-file=/etc/hermitcrab/ssl/tls.key' /tmp/hermitcrab-rendered.yaml
+          ! grep -q -- '--tls-auto-cert-domains' /tmp/hermitcrab-rendered.yaml
+
+      - name: Package chart
+        run: |
+          mkdir -p dist/charts
+          helm package helm/hermitcrab --destination dist/charts
+
+      - name: Upload chart package
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/charts/*.tgz

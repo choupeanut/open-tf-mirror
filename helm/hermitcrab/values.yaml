@@ -1,0 +1,87 @@
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: ""
+
+nameOverride: ""
+fullnameOverride: ""
+namespaceOverride: ""
+
+commonAnnotations: {}
+commonLabels: {}
+
+hermitcrab:
+  name: hermitcrab
+  replicas: 1
+
+  image:
+    repository: sealio/hermitcrab
+    tag: v0.1.4
+    pullPolicy: IfNotPresent
+
+  command:
+    - hermitcrab
+
+  args:
+    - --log-debug
+    - --log-verbosity=4
+
+  env: []
+  envFrom: []
+
+  resources: {}
+
+  startupProbe:
+    initialDelaySeconds: 0
+    timeoutSeconds: 1
+    periodSeconds: 5
+    failureThreshold: 10
+    successThreshold: 1
+
+  readinessProbe:
+    enabled: true
+    timeoutSeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+    successThreshold: 1
+
+  livenessProbe:
+    enabled: true
+    timeoutSeconds: 5
+    periodSeconds: 5
+    failureThreshold: 10
+    successThreshold: 1
+
+  pdb:
+    enabled: true
+    minAvailable: 1
+    maxUnavailable: 0
+
+  service:
+    enabled: true
+    type: ClusterIP
+    ports:
+      http: 80
+      https: 443
+    sessionAffinity: ClientIP
+    sessionAffinityConfig: {}
+
+  pvc:
+    enabled: true
+    subPath: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 1Gi
+
+  tls:
+    enabled: true
+    domainName: ""
+    secretName: ""
+
+  providersMirror:
+    enabled: true
+    image:
+      repository: sealio/terraform-deployer
+      tag: v1.5.7-seal.1
+      pullPolicy: IfNotPresent

@@ -1,0 +1,192 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hermitcrab.name" . }}
+  namespace: {{ include "hermitcrab.namespace" . }}
+  {{- if .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml .Values.commonAnnotations | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- include "hermitcrab.selectorLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "hermitcrab.name" . }}-headless
+  replicas: {{ .Values.hermitcrab.replicas }}
+  selector:
+    matchLabels:
+      {{- include "hermitcrab.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- if .Values.commonAnnotations }}
+      annotations:
+        {{- toYaml .Values.commonAnnotations | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "hermitcrab.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/version: {{ include "hermitcrab.parseImageTag" (dict "image" .Values.hermitcrab.image) | trunc 63 | quote }}
+    spec:
+      automountServiceAccountToken: false
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      shareProcessNamespace: {{ default false .Values.hermitcrab.providersMirror.enabled }}
+      containers:
+        {{- if .Values.hermitcrab.providersMirror.enabled }}
+        - name: {{ include "hermitcrab.name" . }}-providers-mirror
+          image: {{ include "hermitcrab.image" (dict "Values" .Values "image" .Values.hermitcrab.providersMirror.image) }}
+          imagePullPolicy: {{ .Values.hermitcrab.providersMirror.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -e
+              cut -d' ' -f5 </proc/self/stat >/pids/providers-mirror
+              trap 'exit 0' TERM INT
+              sleep infinity & wait
+          volumeMounts:
+            - name: pids
+              mountPath: /pids
+        {{- end }}
+        - name: {{ include "hermitcrab.name" . }}
+          image: {{ include "hermitcrab.image" (dict "Values" .Values "image" .Values.hermitcrab.image) }}
+          imagePullPolicy: {{ .Values.hermitcrab.image.pullPolicy }}
+          {{- if .Values.hermitcrab.command }}
+          command:
+            {{- toYaml .Values.hermitcrab.command | nindent 12 }}
+          {{- end }}
+          {{- $args := .Values.hermitcrab.args }}
+          {{- if not .Values.hermitcrab.tls.enabled }}
+          {{- $args = append $args "--enable-tls=false" }}
+          {{- else if .Values.hermitcrab.tls.secretName }}
+          {{- $argsText := join " " $args }}
+          {{- if not (contains "--tls-cert-file" $argsText) }}
+          {{- $args = append $args "--tls-cert-file=/etc/hermitcrab/ssl/tls.crt" }}
+          {{- end }}
+          {{- if not (contains "--tls-private-key-file" $argsText) }}
+          {{- $args = append $args "--tls-private-key-file=/etc/hermitcrab/ssl/tls.key" }}
+          {{- end }}
+          {{- else if .Values.hermitcrab.tls.domainName }}
+          {{- $args = append $args (printf "--tls-auto-cert-domains=%s" .Values.hermitcrab.tls.domainName) }}
+          {{- end }}
+          {{- if $args }}
+          args:
+            {{- toYaml $args | nindent 12 }}
+          {{- end }}
+          {{- if .Values.hermitcrab.env }}
+          env:
+            {{- toYaml .Values.hermitcrab.env | nindent 12 }}
+          {{- end }}
+          {{- if .Values.hermitcrab.envFrom }}
+          envFrom:
+            {{- toYaml .Values.hermitcrab.envFrom | nindent 12 }}
+          {{- end }}
+          {{- if .Values.hermitcrab.providersMirror.enabled }}
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -e
+                    mkdir -p /usr/share/terraform/providers
+                    ln -s /proc/$(cat /pids/providers-mirror)/$(whoami)/usr/share/terraform/providers/plugins /usr/share/terraform/providers/
+          {{- end }}
+          {{- if .Values.hermitcrab.resources }}
+          resources:
+            {{- toYaml .Values.hermitcrab.resources | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+          startupProbe:
+            initialDelaySeconds: {{ .Values.hermitcrab.startupProbe.initialDelaySeconds }}
+            timeoutSeconds: {{ .Values.hermitcrab.startupProbe.timeoutSeconds }}
+            periodSeconds: {{ .Values.hermitcrab.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.hermitcrab.startupProbe.failureThreshold }}
+            successThreshold: {{ .Values.hermitcrab.startupProbe.successThreshold }}
+            httpGet:
+              port: http
+              path: /readyz
+          {{- if .Values.hermitcrab.readinessProbe.enabled }}
+          readinessProbe:
+            timeoutSeconds: {{ .Values.hermitcrab.readinessProbe.timeoutSeconds }}
+            periodSeconds: {{ .Values.hermitcrab.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.hermitcrab.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.hermitcrab.readinessProbe.successThreshold }}
+            httpGet:
+              port: http
+              path: /readyz
+          {{- end }}
+          {{- if .Values.hermitcrab.livenessProbe.enabled }}
+          livenessProbe:
+            timeoutSeconds: {{ .Values.hermitcrab.livenessProbe.timeoutSeconds }}
+            periodSeconds: {{ .Values.hermitcrab.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.hermitcrab.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.hermitcrab.livenessProbe.successThreshold }}
+            httpGet:
+              httpHeaders:
+                - name: User-Agent
+                  value: ""
+              port: http
+              path: /livez
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/run/hermitcrab
+              {{- if and .Values.hermitcrab.pvc.enabled .Values.hermitcrab.pvc.subPath }}
+              subPath: {{ .Values.hermitcrab.pvc.subPath }}
+              {{- end }}
+            {{- if and .Values.hermitcrab.tls.enabled .Values.hermitcrab.tls.secretName }}
+            - name: custom-tls
+              mountPath: /etc/hermitcrab/ssl
+              readOnly: true
+            {{- end }}
+            {{- if .Values.hermitcrab.providersMirror.enabled }}
+            - name: pids
+              mountPath: /pids
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if not .Values.hermitcrab.pvc.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if and .Values.hermitcrab.tls.enabled .Values.hermitcrab.tls.secretName }}
+        - name: custom-tls
+          secret:
+            secretName: {{ .Values.hermitcrab.tls.secretName }}
+        {{- end }}
+        {{- if .Values.hermitcrab.providersMirror.enabled }}
+        - name: pids
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.hermitcrab.pvc.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        {{- if .Values.commonAnnotations }}
+        annotations:
+          {{- toYaml .Values.commonAnnotations | nindent 10 }}
+        {{- end }}
+        labels:
+          {{- include "hermitcrab.selectorLabels" . | nindent 10 }}
+      spec:
+        {{- $storageClass := include "hermitcrab.storageClass" (dict "Values" .Values "pvc" .Values.hermitcrab.pvc) }}
+        {{- if $storageClass }}
+        storageClassName: {{ $storageClass | quote }}
+        {{- end }}
+        {{- if .Values.hermitcrab.pvc.accessModes }}
+        accessModes:
+          {{- toYaml .Values.hermitcrab.pvc.accessModes | nindent 10 }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.hermitcrab.pvc.size | quote }}
+  {{- end }}
