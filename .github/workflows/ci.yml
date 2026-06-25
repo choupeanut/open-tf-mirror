@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  IMAGE_NAME: choupeanut/open-tf-mirror
+  IMAGE_TAG: 0.1.0
+
 jobs:
   rust:
     name: Rust checks
@@ -34,7 +38,7 @@ jobs:
         run: cargo test --all-targets
 
   container:
-    name: Docker build
+    name: Docker build and publish
     runs-on: ubuntu-latest
     needs: rust
 
@@ -43,7 +47,23 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build --tag open-tf-mirror:ci .
+        run: |
+          docker build \
+            --tag "$IMAGE_NAME:$IMAGE_TAG" \
+            --tag "$IMAGE_NAME:sha-${GITHUB_SHA}" \
+            --tag "$IMAGE_NAME:main" \
+            .
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.DOCKERHUB_PAT }}" | docker login --username choupeanut --password-stdin
+
+      - name: Push Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          docker push "$IMAGE_NAME:sha-${GITHUB_SHA}"
+          docker push "$IMAGE_NAME:main"
 
   helm:
     name: Helm chart
@@ -59,42 +79,42 @@ jobs:
           version: v3.15.4
 
       - name: Lint chart
-        run: helm lint helm/hermitcrab
+        run: helm lint charts/open-tf-mirror
 
-      - name: Render chart with existing Argo CD values shape
+      - name: Render chart with Argo CD values shape
         run: |
-          helm template hermitcrab helm/hermitcrab \
-            --namespace hermitcrab \
-            --set fullnameOverride=hermitcrab \
-            --set hermitcrab.image.repository=ghcr.io/choupeanut/open-tf-mirror \
-            --set hermitcrab.image.tag=0.1.0 \
-            --set hermitcrab.replicas=2 \
-            --set hermitcrab.args[0]=--log-debug \
-            --set hermitcrab.args[1]=--log-verbosity=4 \
-            --set hermitcrab.args[2]=--conn-burst=500 \
-            --set hermitcrab.args[3]=--conn-qps=500 \
-            --set hermitcrab.args[4]=--tls-cert-file=/etc/hermitcrab/ssl/tls.crt \
-            --set hermitcrab.args[5]=--tls-private-key-file=/etc/hermitcrab/ssl/tls.key \
-            --set hermitcrab.tls.enabled=true \
-            --set hermitcrab.tls.domainName=it-will-be-ignored.example.com \
-            --set hermitcrab.tls.secretName=hermitcrab-tls-secret \
-            --set hermitcrab.pvc.size=20Gi \
-            --set hermitcrab.pvc.storageClass=hyperdisk-balanced \
-            >/tmp/hermitcrab-rendered.yaml
-          grep -q 'name: hermitcrab-hermitcrab$' /tmp/hermitcrab-rendered.yaml
-          grep -q 'name: hermitcrab-hermitcrab-headless$' /tmp/hermitcrab-rendered.yaml
-          grep -q 'containerPort: 8080$' /tmp/hermitcrab-rendered.yaml
-          grep -q 'containerPort: 8443$' /tmp/hermitcrab-rendered.yaml
-          grep -q -- '--tls-private-key-file=/etc/hermitcrab/ssl/tls.key' /tmp/hermitcrab-rendered.yaml
-          ! grep -q -- '--tls-auto-cert-domains' /tmp/hermitcrab-rendered.yaml
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --namespace open-tf-mirror \
+            --set fullnameOverride=open-tf-mirror \
+            --set openTfMirror.image.repository=choupeanut/open-tf-mirror \
+            --set openTfMirror.image.tag=0.1.0 \
+            --set openTfMirror.replicas=2 \
+            --set openTfMirror.args[0]=--log-debug \
+            --set openTfMirror.args[1]=--log-verbosity=4 \
+            --set openTfMirror.args[2]=--conn-burst=500 \
+            --set openTfMirror.args[3]=--conn-qps=500 \
+            --set openTfMirror.args[4]=--tls-cert-file=/etc/open-tf-mirror/ssl/tls.crt \
+            --set openTfMirror.args[5]=--tls-private-key-file=/etc/open-tf-mirror/ssl/tls.key \
+            --set openTfMirror.tls.enabled=true \
+            --set openTfMirror.tls.domainName=it-will-be-ignored.example.com \
+            --set openTfMirror.tls.secretName=open-tf-mirror-tls-secret \
+            --set openTfMirror.pvc.size=20Gi \
+            --set openTfMirror.pvc.storageClass=hyperdisk-balanced \
+            >/tmp/open-tf-mirror-rendered.yaml
+          grep -q 'name: open-tf-mirror$' /tmp/open-tf-mirror-rendered.yaml
+          grep -q 'name: open-tf-mirror-headless$' /tmp/open-tf-mirror-rendered.yaml
+          grep -q 'containerPort: 8080$' /tmp/open-tf-mirror-rendered.yaml
+          grep -q 'containerPort: 8443$' /tmp/open-tf-mirror-rendered.yaml
+          grep -q -- '--tls-private-key-file=/etc/open-tf-mirror/ssl/tls.key' /tmp/open-tf-mirror-rendered.yaml
+          ! grep -q -- '--tls-auto-cert-domains' /tmp/open-tf-mirror-rendered.yaml
 
       - name: Package chart
         run: |
           mkdir -p dist/charts
-          helm package helm/hermitcrab --destination dist/charts
+          helm package charts/open-tf-mirror --destination dist/charts
 
       - name: Upload chart package
         uses: actions/upload-artifact@v4
         with:
-          name: helm-chart
+          name: open-tf-mirror-chart
           path: dist/charts/*.tgz

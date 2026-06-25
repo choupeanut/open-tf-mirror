@@ -1,0 +1,59 @@
+{{- if .Values.openTfMirror.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "open-tf-mirror.name" . }}
+  namespace: {{ include "open-tf-mirror.namespace" . }}
+  {{- if .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml .Values.commonAnnotations | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}
+spec:
+  type: {{ .Values.openTfMirror.service.type }}
+  {{- if .Values.openTfMirror.service.sessionAffinity }}
+  sessionAffinity: {{ .Values.openTfMirror.service.sessionAffinity }}
+  {{- end }}
+  {{- if .Values.openTfMirror.service.sessionAffinityConfig }}
+  sessionAffinityConfig:
+    {{- toYaml .Values.openTfMirror.service.sessionAffinityConfig | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: http
+      port: {{ .Values.openTfMirror.service.ports.http }}
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: {{ .Values.openTfMirror.service.ports.https }}
+      targetPort: https
+      protocol: TCP
+  selector:
+    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "open-tf-mirror.name" . }}-headless
+  namespace: {{ include "open-tf-mirror.namespace" . }}
+  {{- if .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml .Values.commonAnnotations | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http
+      port: {{ .Values.openTfMirror.service.ports.http }}
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: {{ .Values.openTfMirror.service.ports.https }}
+      targetPort: https
+      protocol: TCP
+  selector:
+    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}

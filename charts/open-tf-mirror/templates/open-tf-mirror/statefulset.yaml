@@ -1,0 +1,192 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "open-tf-mirror.name" . }}
+  namespace: {{ include "open-tf-mirror.namespace" . }}
+  {{- if .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml .Values.commonAnnotations | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "open-tf-mirror.name" . }}-headless
+  replicas: {{ .Values.openTfMirror.replicas }}
+  selector:
+    matchLabels:
+      {{- include "open-tf-mirror.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- if .Values.commonAnnotations }}
+      annotations:
+        {{- toYaml .Values.commonAnnotations | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "open-tf-mirror.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/version: {{ include "open-tf-mirror.parseImageTag" (dict "image" .Values.openTfMirror.image) | trunc 63 | quote }}
+    spec:
+      automountServiceAccountToken: false
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      shareProcessNamespace: {{ default false .Values.openTfMirror.providersMirror.enabled }}
+      containers:
+        {{- if .Values.openTfMirror.providersMirror.enabled }}
+        - name: {{ include "open-tf-mirror.name" . }}-providers-mirror
+          image: {{ include "open-tf-mirror.image" (dict "Values" .Values "image" .Values.openTfMirror.providersMirror.image) }}
+          imagePullPolicy: {{ .Values.openTfMirror.providersMirror.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -e
+              cut -d' ' -f5 </proc/self/stat >/pids/providers-mirror
+              trap 'exit 0' TERM INT
+              sleep infinity & wait
+          volumeMounts:
+            - name: pids
+              mountPath: /pids
+        {{- end }}
+        - name: {{ include "open-tf-mirror.name" . }}
+          image: {{ include "open-tf-mirror.image" (dict "Values" .Values "image" .Values.openTfMirror.image) }}
+          imagePullPolicy: {{ .Values.openTfMirror.image.pullPolicy }}
+          {{- if .Values.openTfMirror.command }}
+          command:
+            {{- toYaml .Values.openTfMirror.command | nindent 12 }}
+          {{- end }}
+          {{- $args := .Values.openTfMirror.args }}
+          {{- if not .Values.openTfMirror.tls.enabled }}
+          {{- $args = append $args "--enable-tls=false" }}
+          {{- else if .Values.openTfMirror.tls.secretName }}
+          {{- $argsText := join " " $args }}
+          {{- if not (contains "--tls-cert-file" $argsText) }}
+          {{- $args = append $args "--tls-cert-file=/etc/open-tf-mirror/ssl/tls.crt" }}
+          {{- end }}
+          {{- if not (contains "--tls-private-key-file" $argsText) }}
+          {{- $args = append $args "--tls-private-key-file=/etc/open-tf-mirror/ssl/tls.key" }}
+          {{- end }}
+          {{- else if .Values.openTfMirror.tls.domainName }}
+          {{- $args = append $args (printf "--tls-auto-cert-domains=%s" .Values.openTfMirror.tls.domainName) }}
+          {{- end }}
+          {{- if $args }}
+          args:
+            {{- toYaml $args | nindent 12 }}
+          {{- end }}
+          {{- if .Values.openTfMirror.env }}
+          env:
+            {{- toYaml .Values.openTfMirror.env | nindent 12 }}
+          {{- end }}
+          {{- if .Values.openTfMirror.envFrom }}
+          envFrom:
+            {{- toYaml .Values.openTfMirror.envFrom | nindent 12 }}
+          {{- end }}
+          {{- if .Values.openTfMirror.providersMirror.enabled }}
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -e
+                    mkdir -p /usr/share/terraform/providers
+                    ln -s /proc/$(cat /pids/providers-mirror)/$(whoami)/usr/share/terraform/providers/plugins /usr/share/terraform/providers/
+          {{- end }}
+          {{- if .Values.openTfMirror.resources }}
+          resources:
+            {{- toYaml .Values.openTfMirror.resources | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.openTfMirror.service.targetPorts.http }}
+              protocol: TCP
+            - name: https
+              containerPort: {{ .Values.openTfMirror.service.targetPorts.https }}
+              protocol: TCP
+          startupProbe:
+            initialDelaySeconds: {{ .Values.openTfMirror.startupProbe.initialDelaySeconds }}
+            timeoutSeconds: {{ .Values.openTfMirror.startupProbe.timeoutSeconds }}
+            periodSeconds: {{ .Values.openTfMirror.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.openTfMirror.startupProbe.failureThreshold }}
+            successThreshold: {{ .Values.openTfMirror.startupProbe.successThreshold }}
+            httpGet:
+              port: http
+              path: /readyz
+          {{- if .Values.openTfMirror.readinessProbe.enabled }}
+          readinessProbe:
+            timeoutSeconds: {{ .Values.openTfMirror.readinessProbe.timeoutSeconds }}
+            periodSeconds: {{ .Values.openTfMirror.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.openTfMirror.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.openTfMirror.readinessProbe.successThreshold }}
+            httpGet:
+              port: http
+              path: /readyz
+          {{- end }}
+          {{- if .Values.openTfMirror.livenessProbe.enabled }}
+          livenessProbe:
+            timeoutSeconds: {{ .Values.openTfMirror.livenessProbe.timeoutSeconds }}
+            periodSeconds: {{ .Values.openTfMirror.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.openTfMirror.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.openTfMirror.livenessProbe.successThreshold }}
+            httpGet:
+              httpHeaders:
+                - name: User-Agent
+                  value: ""
+              port: http
+              path: /livez
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/run/open-tf-mirror
+              {{- if and .Values.openTfMirror.pvc.enabled .Values.openTfMirror.pvc.subPath }}
+              subPath: {{ .Values.openTfMirror.pvc.subPath }}
+              {{- end }}
+            {{- if and .Values.openTfMirror.tls.enabled .Values.openTfMirror.tls.secretName }}
+            - name: custom-tls
+              mountPath: /etc/open-tf-mirror/ssl
+              readOnly: true
+            {{- end }}
+            {{- if .Values.openTfMirror.providersMirror.enabled }}
+            - name: pids
+              mountPath: /pids
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if not .Values.openTfMirror.pvc.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- if and .Values.openTfMirror.tls.enabled .Values.openTfMirror.tls.secretName }}
+        - name: custom-tls
+          secret:
+            secretName: {{ .Values.openTfMirror.tls.secretName }}
+        {{- end }}
+        {{- if .Values.openTfMirror.providersMirror.enabled }}
+        - name: pids
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.openTfMirror.pvc.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        {{- if .Values.commonAnnotations }}
+        annotations:
+          {{- toYaml .Values.commonAnnotations | nindent 10 }}
+        {{- end }}
+        labels:
+          {{- include "open-tf-mirror.selectorLabels" . | nindent 10 }}
+      spec:
+        {{- $storageClass := include "open-tf-mirror.storageClass" (dict "Values" .Values "pvc" .Values.openTfMirror.pvc) }}
+        {{- if $storageClass }}
+        storageClassName: {{ $storageClass | quote }}
+        {{- end }}
+        {{- if .Values.openTfMirror.pvc.accessModes }}
+        accessModes:
+          {{- toYaml .Values.openTfMirror.pvc.accessModes | nindent 10 }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.openTfMirror.pvc.size | quote }}
+  {{- end }}

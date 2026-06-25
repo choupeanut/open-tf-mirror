@@ -22,7 +22,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "hermitcrab", version)]
+#[command(name = "open-tf-mirror", version)]
 struct Args {
     #[arg(long, env = "SERVER_BIND_ADDRESS", default_value = "0.0.0.0")]
     bind_address: String,
@@ -48,7 +48,7 @@ struct Args {
     #[arg(
         long,
         env = "SERVER_DATA_SOURCE_DIR",
-        default_value = "/var/run/hermitcrab"
+        default_value = "/var/run/open-tf-mirror"
     )]
     data_source_dir: PathBuf,
 
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn cli_defaults_to_unprivileged_container_ports() {
-        let args = Args::parse_from(["hermitcrab", "--enable-tls=false"]);
+        let args = Args::parse_from(["open-tf-mirror", "--enable-tls=false"]);
 
         assert_eq!(args.http_port, 8080);
         assert_eq!(args.https_port, 8443);
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn cli_accepts_auto_cert_domain_argument_for_chart_compatibility() {
         let args = Args::parse_from([
-            "hermitcrab",
+            "open-tf-mirror",
             "--tls-auto-cert-domains=mirror.example.com",
             "--enable-tls=false",
         ]);

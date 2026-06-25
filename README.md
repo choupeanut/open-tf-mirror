@@ -1,7 +1,6 @@
 # open-tf-mirror
 
-High-performance Rust implementation of a Terraform/OpenTofu network mirror with
-Hermit Crab-compatible deployment defaults.
+High-performance Rust implementation of a Terraform/OpenTofu network mirror.
 
 ## Features
 
@@ -10,8 +9,7 @@ Hermit Crab-compatible deployment defaults.
 - Terraform module archive mirror endpoint under `/v1/modules/`; local cache hits
   are served directly and cache misses are fetched from the upstream registry.
 - Custom TLS certificate reload for Kubernetes Secret/cert-manager rotation.
-- Helm chart under `helm/hermitcrab` preserving the existing Hermit Crab chart
-  values and Kubernetes resource naming contract.
+- Helm chart under `charts/open-tf-mirror`.
 
 ## CI
 
@@ -20,10 +18,10 @@ GitHub Actions runs on every push and pull request:
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets`
-- Docker image build
+- Docker image build and Docker Hub publish from `main`
 - Helm chart lint, compatibility render, and package artifact upload
 
 ## Helm Chart Versioning
 
-The chart is versioned in `helm/hermitcrab/Chart.yaml`. CI packages the chart on
+The chart is versioned in `charts/open-tf-mirror/Chart.yaml`. CI packages the chart on
 every run, so chart changes are tracked and validated with the code they deploy.

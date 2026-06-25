@@ -15,7 +15,6 @@ RUN apt-get update \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
 COPY --from=builder /app/target/release/open-tf-mirror /usr/local/bin/open-tf-mirror
-RUN ln -s /usr/local/bin/open-tf-mirror /usr/local/bin/hermitcrab
 
 USER appuser
 

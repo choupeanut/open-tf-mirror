@@ -10,17 +10,16 @@ namespaceOverride: ""
 commonAnnotations: {}
 commonLabels: {}
 
-hermitcrab:
-  name: hermitcrab
+openTfMirror:
   replicas: 1
 
   image:
-    repository: ghcr.io/choupeanut/open-tf-mirror
+    repository: choupeanut/open-tf-mirror
     tag: 0.1.0
     pullPolicy: IfNotPresent
 
   command:
-    - hermitcrab
+    - open-tf-mirror
 
   args:
     - --log-debug

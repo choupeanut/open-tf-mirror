@@ -1,14 +1,14 @@
 {{/*
 Parse image tag for app.kubernetes.io/version labels.
 */}}
-{{- define "hermitcrab.parseImageTag" -}}
+{{- define "open-tf-mirror.parseImageTag" -}}
 {{- regexReplaceAll "[^a-zA-Z0-9-_.]+" (regexReplaceAll "@sha256:[a-f0-9]+" .image.tag "") "" -}}
 {{- end -}}
 
 {{/*
 Build image reference, honoring global.imageRegistry.
 */}}
-{{- define "hermitcrab.image" -}}
+{{- define "open-tf-mirror.image" -}}
 {{- if .Values.global.imageRegistry -}}
 {{- printf "%s/%s:%s" .Values.global.imageRegistry .image.repository (default "latest" .image.tag) -}}
 {{- else -}}
@@ -19,25 +19,25 @@ Build image reference, honoring global.imageRegistry.
 {{/*
 Resolve PVC storageClass, honoring global.storageClass.
 */}}
-{{- define "hermitcrab.storageClass" -}}
+{{- define "open-tf-mirror.storageClass" -}}
 {{- default .Values.global.storageClass .pvc.storageClass -}}
 {{- end -}}
 
 {{/*
 Expand the chart name.
 */}}
-{{- define "hermitcrab.commonName" -}}
+{{- define "open-tf-mirror.commonName" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/*
 Create a fully qualified base name.
 */}}
-{{- define "hermitcrab.fullname" -}}
+{{- define "open-tf-mirror.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
-{{- $name := include "hermitcrab.commonName" . -}}
+{{- $name := include "open-tf-mirror.commonName" . -}}
 {{- if contains $name .Release.Name -}}
 {{- .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
@@ -49,30 +49,30 @@ Create a fully qualified base name.
 {{/*
 Resolve namespace.
 */}}
-{{- define "hermitcrab.namespace" -}}
+{{- define "open-tf-mirror.namespace" -}}
 {{- default .Release.Namespace .Values.namespaceOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/*
 Create chart label.
 */}}
-{{- define "hermitcrab.chart" -}}
+{{- define "open-tf-mirror.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/*
-Hermit Crab resource name. With fullnameOverride=hermitcrab and hermitcrab.name=hermitcrab this is hermitcrab-hermitcrab.
+open-tf-mirror resource name.
 */}}
-{{- define "hermitcrab.name" -}}
-{{- printf "%s-%s" (include "hermitcrab.fullname" .) .Values.hermitcrab.name | trunc 63 | trimSuffix "-" -}}
+{{- define "open-tf-mirror.name" -}}
+{{- include "open-tf-mirror.fullname" . -}}
 {{- end -}}
 
 {{/*
 Common labels.
 */}}
-{{- define "hermitcrab.labels" -}}
-helm.sh/chart: {{ include "hermitcrab.chart" . }}
-app.kubernetes.io/part-of: hermitcrab
+{{- define "open-tf-mirror.labels" -}}
+helm.sh/chart: {{ include "open-tf-mirror.chart" . }}
+app.kubernetes.io/part-of: open-tf-mirror
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
@@ -80,8 +80,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels.
 */}}
-{{- define "hermitcrab.selectorLabels" -}}
-{{ include "hermitcrab.labels" . }}
+{{- define "open-tf-mirror.selectorLabels" -}}
+{{ include "open-tf-mirror.labels" . }}
 app.kubernetes.io/component: server
 {{- if .Values.commonLabels }}
 {{ toYaml .Values.commonLabels }}
