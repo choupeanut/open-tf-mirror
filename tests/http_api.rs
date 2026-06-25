@@ -64,6 +64,23 @@ async fn provider_index_json_returns_versions_object() {
 }
 
 #[tokio::test]
+async fn provider_metadata_rejects_actions_without_json_suffix() {
+    let app = build_router(AppState::for_tests(tempfile::tempdir().unwrap().path()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/providers/registry.terraform.io/hashicorp/random/index.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn provider_version_json_returns_relative_download_archives() {
     let tmp = tempfile::tempdir().unwrap();
     let metadata = ProviderMetadataStore::default();

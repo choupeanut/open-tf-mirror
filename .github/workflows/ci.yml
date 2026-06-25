@@ -83,6 +83,8 @@ jobs:
             >/tmp/hermitcrab-rendered.yaml
           grep -q 'name: hermitcrab-hermitcrab$' /tmp/hermitcrab-rendered.yaml
           grep -q 'name: hermitcrab-hermitcrab-headless$' /tmp/hermitcrab-rendered.yaml
+          grep -q 'containerPort: 8080$' /tmp/hermitcrab-rendered.yaml
+          grep -q 'containerPort: 8443$' /tmp/hermitcrab-rendered.yaml
           grep -q -- '--tls-private-key-file=/etc/hermitcrab/ssl/tls.key' /tmp/hermitcrab-rendered.yaml
           ! grep -q -- '--tls-auto-cert-domains' /tmp/hermitcrab-rendered.yaml
 

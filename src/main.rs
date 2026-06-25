@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::Router;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     service::TowerToHyperService,
@@ -15,7 +15,7 @@ use open_tf_mirror::{
     tls_reload::ReloadingCertResolver,
 };
 use rustls::ServerConfig;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -27,7 +27,13 @@ struct Args {
     #[arg(long, env = "SERVER_BIND_ADDRESS", default_value = "0.0.0.0")]
     bind_address: String,
 
-    #[arg(long, env = "SERVER_ENABLE_TLS", default_value_t = true)]
+    #[arg(long, env = "SERVER_HTTP_PORT", default_value_t = 8080)]
+    http_port: u16,
+
+    #[arg(long, env = "SERVER_HTTPS_PORT", default_value_t = 8443)]
+    https_port: u16,
+
+    #[arg(long, env = "SERVER_ENABLE_TLS", default_value_t = true, action = ArgAction::Set)]
     enable_tls: bool,
 
     #[arg(long, env = "SERVER_TLS_CERT_FILE")]
@@ -35,6 +41,9 @@ struct Args {
 
     #[arg(long, env = "SERVER_TLS_PRIVATE_KEY_FILE")]
     tls_private_key_file: Option<PathBuf>,
+
+    #[arg(long, env = "SERVER_TLS_AUTO_CERT_DOMAINS", value_delimiter = ',')]
+    tls_auto_cert_domains: Vec<String>,
 
     #[arg(
         long,
@@ -80,12 +89,17 @@ async fn main() -> Result<()> {
             .into_inner(),
     );
 
-    let http_addr: SocketAddr = format!("{}:80", args.bind_address)
-        .parse()
-        .context("parse HTTP bind address")?;
+    let http_addr = bind_addr(&args.bind_address, args.http_port, "HTTP")?;
     let http = serve_http(http_addr, app.clone());
 
     if args.enable_tls {
+        if !args.tls_auto_cert_domains.is_empty()
+            && (args.tls_cert_file.is_none() || args.tls_private_key_file.is_none())
+        {
+            anyhow::bail!(
+                "--tls-auto-cert-domains is accepted for chart compatibility, but ACME auto certificate issuance is not implemented yet; configure --tls-cert-file and --tls-private-key-file"
+            );
+        }
         let cert = args
             .tls_cert_file
             .as_ref()
@@ -94,16 +108,26 @@ async fn main() -> Result<()> {
             .tls_private_key_file
             .as_ref()
             .context("--tls-private-key-file is required when TLS is enabled")?;
-        let https_addr: SocketAddr = format!("{}:443", args.bind_address)
-            .parse()
-            .context("parse HTTPS bind address")?;
-        let https = serve_https(https_addr, cert.clone(), key.clone(), app);
+        let https_addr = bind_addr(&args.bind_address, args.https_port, "HTTPS")?;
+        let https = serve_https(
+            https_addr,
+            cert.clone(),
+            key.clone(),
+            app,
+            args.conn_burst as usize,
+        );
         tokio::try_join!(http, https)?;
     } else {
         http.await?;
     }
 
     Ok(())
+}
+
+fn bind_addr(bind_address: &str, port: u16, label: &str) -> Result<SocketAddr> {
+    format!("{bind_address}:{port}")
+        .parse()
+        .with_context(|| format!("parse {label} bind address"))
 }
 
 fn init_tracing(debug: bool, verbosity: u8) {
@@ -132,6 +156,7 @@ async fn serve_https(
     cert_path: PathBuf,
     key_path: PathBuf,
     app: Router,
+    conn_burst: usize,
 ) -> Result<()> {
     let resolver = ReloadingCertResolver::new(cert_path, key_path)?;
     let mut config = ServerConfig::builder()
@@ -143,12 +168,19 @@ async fn serve_https(
         .await
         .with_context(|| format!("bind HTTPS listener on {addr}"))?;
     tracing::info!(%addr, "serving HTTPS");
+    let semaphore = Arc::new(Semaphore::new(conn_burst.max(1)));
 
     loop {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("connection limiter closed")?;
         let (stream, peer_addr) = listener.accept().await.context("accept TLS connection")?;
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let Ok(stream) = acceptor.accept(stream).await else {
                 tracing::debug!(%peer_addr, "TLS handshake failed");
                 return;
@@ -162,5 +194,41 @@ async fn serve_https(
                 tracing::debug!(%peer_addr, error = %err, "HTTPS connection failed");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, bind_addr};
+
+    #[test]
+    fn cli_defaults_to_unprivileged_container_ports() {
+        let args = Args::parse_from(["hermitcrab", "--enable-tls=false"]);
+
+        assert_eq!(args.http_port, 8080);
+        assert_eq!(args.https_port, 8443);
+    }
+
+    #[test]
+    fn cli_accepts_auto_cert_domain_argument_for_chart_compatibility() {
+        let args = Args::parse_from([
+            "hermitcrab",
+            "--tls-auto-cert-domains=mirror.example.com",
+            "--enable-tls=false",
+        ]);
+
+        assert_eq!(
+            args.tls_auto_cert_domains,
+            vec!["mirror.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn bind_address_uses_configured_port() {
+        let addr = bind_addr("127.0.0.1", 18080, "HTTP").unwrap();
+
+        assert_eq!(addr.port(), 18080);
     }
 }

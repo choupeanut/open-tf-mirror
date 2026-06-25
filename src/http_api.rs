@@ -9,6 +9,7 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
+use tokio_util::io::ReaderStream;
 
 use crate::{
     metadata::ProviderMetadataStore,
@@ -86,11 +87,11 @@ async fn get_provider_metadata(
         String,
     )>,
 ) -> impl IntoResponse {
-    if action.len() <= 5 {
+    let Some(version) = action.strip_suffix(".json").map(str::trim) else {
         return StatusCode::BAD_REQUEST.into_response();
-    }
+    };
 
-    let version = action[..action.len() - 5].trim_start_matches('v');
+    let version = version.trim_start_matches('v');
     if version == "index" {
         let versions = state
             .metadata
@@ -158,15 +159,15 @@ async fn download_provider_archive(
         filename: archive.clone(),
     };
     let path = state.provider_storage.archive_path(&key);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let mut response = Body::from(bytes).into_response();
+    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/zip"),
@@ -210,12 +211,12 @@ async fn download_module_archive(
         }
     };
 
-    let bytes = match tokio::fs::read(&resolved.path).await {
-        Ok(bytes) => bytes,
+    let file = match tokio::fs::File::open(&resolved.path).await {
+        Ok(file) => file,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let mut response = Body::from(bytes).into_response();
+    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/gzip"),

@@ -15,8 +15,8 @@ hermitcrab:
   replicas: 1
 
   image:
-    repository: sealio/hermitcrab
-    tag: v0.1.4
+    repository: ghcr.io/choupeanut/open-tf-mirror
+    tag: 0.1.0
     pullPolicy: IfNotPresent
 
   command:
@@ -63,6 +63,9 @@ hermitcrab:
     ports:
       http: 80
       https: 443
+    targetPorts:
+      http: 8080
+      https: 8443
     sessionAffinity: ClientIP
     sessionAffinityConfig: {}
 

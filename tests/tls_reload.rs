@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use open_tf_mirror::tls_reload::ReloadingCertResolver;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -59,14 +59,65 @@ fn reloading_cert_files_changes_future_resolved_certificate() {
     fs::copy(tmp.path().join("first.crt"), &live_cert).unwrap();
     fs::copy(tmp.path().join("first.key"), &live_key).unwrap();
 
-    let resolver = ReloadingCertResolver::new(&live_cert, &live_key).unwrap();
-    let initially_resolved = resolver.resolve_current_cert().unwrap();
+    let resolver =
+        ReloadingCertResolver::new_with_reload_interval(&live_cert, &live_key, Duration::ZERO)
+            .unwrap();
+    let initially_resolved = resolver.resolve_current_cert();
     assert_eq!(leaf_cert_der(&initially_resolved), first_cert);
 
     fs::copy(tmp.path().join("second.crt"), &live_cert).unwrap();
     fs::copy(tmp.path().join("second.key"), &live_key).unwrap();
 
-    let reloaded = resolver.resolve_current_cert().unwrap();
+    let reloaded = resolver.resolve_current_cert();
     assert_eq!(leaf_cert_der(&reloaded), second_cert);
     assert_ne!(leaf_cert_der(&reloaded), leaf_cert_der(&initially_resolved));
+}
+
+#[test]
+fn resolver_uses_cached_certificate_within_reload_interval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_cert = write_cert_pair(tmp.path(), "first");
+    write_cert_pair(tmp.path(), "second");
+
+    let live_cert = tmp.path().join("live.crt");
+    let live_key = tmp.path().join("live.key");
+    fs::copy(tmp.path().join("first.crt"), &live_cert).unwrap();
+    fs::copy(tmp.path().join("first.key"), &live_key).unwrap();
+
+    let resolver = ReloadingCertResolver::new_with_reload_interval(
+        &live_cert,
+        &live_key,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let initially_resolved = resolver.resolve_current_cert();
+    assert_eq!(leaf_cert_der(&initially_resolved), first_cert);
+
+    fs::copy(tmp.path().join("second.crt"), &live_cert).unwrap();
+    fs::copy(tmp.path().join("second.key"), &live_key).unwrap();
+
+    let cached = resolver.resolve_current_cert();
+    assert_eq!(leaf_cert_der(&cached), first_cert);
+}
+
+#[test]
+fn resolver_falls_back_to_last_good_certificate_when_reload_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_cert = write_cert_pair(tmp.path(), "first");
+
+    let live_cert = tmp.path().join("live.crt");
+    let live_key = tmp.path().join("live.key");
+    fs::copy(tmp.path().join("first.crt"), &live_cert).unwrap();
+    fs::copy(tmp.path().join("first.key"), &live_key).unwrap();
+
+    let resolver =
+        ReloadingCertResolver::new_with_reload_interval(&live_cert, &live_key, Duration::ZERO)
+            .unwrap();
+    let initially_resolved = resolver.resolve_current_cert();
+    assert_eq!(leaf_cert_der(&initially_resolved), first_cert);
+
+    fs::write(&live_cert, "not a certificate").unwrap();
+
+    let fallback = resolver.resolve_current_cert();
+    assert_eq!(leaf_cert_der(&fallback), first_cert);
 }
