@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: choupeanut/open-tf-mirror
+  IMAGE_REPOSITORY: open-tf-mirror
   IMAGE_TAG: 0.1.0
 
 jobs:
@@ -48,22 +48,30 @@ jobs:
 
       - name: Build Docker image
         run: |
+          IMAGE_NAME="${DOCKERHUB_USERNAME}/${IMAGE_REPOSITORY}"
           docker build \
             --tag "$IMAGE_NAME:$IMAGE_TAG" \
             --tag "$IMAGE_NAME:sha-${GITHUB_SHA}" \
             --tag "$IMAGE_NAME:main" \
             .
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || github.repository_owner }}
 
       - name: Login to Docker Hub
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: echo "${{ secrets.DOCKERHUB_PAT }}" | docker login --username choupeanut --password-stdin
+        run: echo "${{ secrets.DOCKERHUB_PAT }}" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || github.repository_owner }}
 
       - name: Push Docker image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
+          IMAGE_NAME="${DOCKERHUB_USERNAME}/${IMAGE_REPOSITORY}"
           docker push "$IMAGE_NAME:$IMAGE_TAG"
           docker push "$IMAGE_NAME:sha-${GITHUB_SHA}"
           docker push "$IMAGE_NAME:main"
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || github.repository_owner }}
 
   helm:
     name: Helm chart
