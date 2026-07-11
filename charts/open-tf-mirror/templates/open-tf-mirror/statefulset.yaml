@@ -8,13 +8,13 @@ metadata:
     {{- toYaml .Values.commonAnnotations | nindent 4 }}
   {{- end }}
   labels:
-    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}
+    {{- include "open-tf-mirror.labels" . | nindent 4 }}
 spec:
   serviceName: {{ include "open-tf-mirror.name" . }}-headless
   replicas: {{ .Values.openTfMirror.replicas }}
   selector:
     matchLabels:
-      {{- include "open-tf-mirror.selectorLabels" . | nindent 6 }}
+      {{- include "open-tf-mirror.matchLabels" . | nindent 6 }}
   template:
     metadata:
       {{- if .Values.commonAnnotations }}
@@ -22,36 +22,40 @@ spec:
         {{- toYaml .Values.commonAnnotations | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "open-tf-mirror.selectorLabels" . | nindent 8 }}
+        {{- include "open-tf-mirror.labels" . | nindent 8 }}
         app.kubernetes.io/version: {{ include "open-tf-mirror.parseImageTag" (dict "image" .Values.openTfMirror.image) | trunc 63 | quote }}
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.openTfMirror.podSecurityContext | nindent 8 }}
       {{- if .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
       {{- end }}
-      shareProcessNamespace: {{ default false .Values.openTfMirror.providersMirror.enabled }}
-      containers:
-        {{- if .Values.openTfMirror.providersMirror.enabled }}
+      {{- if .Values.openTfMirror.providersMirror.enabled }}
+      initContainers:
         - name: {{ include "open-tf-mirror.name" . }}-providers-mirror
           image: {{ include "open-tf-mirror.image" (dict "Values" .Values "image" .Values.openTfMirror.providersMirror.image) }}
           imagePullPolicy: {{ .Values.openTfMirror.providersMirror.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.openTfMirror.containerSecurityContext | nindent 12 }}
           command:
             - /bin/sh
             - -c
           args:
             - |
-              set -e
-              cut -d' ' -f5 </proc/self/stat >/pids/providers-mirror
-              trap 'exit 0' TERM INT
-              sleep infinity & wait
+              set -eu
+              cp -R /usr/share/terraform/providers/plugins/. /providers-mirror/
           volumeMounts:
-            - name: pids
-              mountPath: /pids
-        {{- end }}
+            - name: providers-mirror
+              mountPath: /providers-mirror
+      {{- end }}
+      containers:
         - name: {{ include "open-tf-mirror.name" . }}
           image: {{ include "open-tf-mirror.image" (dict "Values" .Values "image" .Values.openTfMirror.image) }}
           imagePullPolicy: {{ .Values.openTfMirror.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.openTfMirror.containerSecurityContext | nindent 12 }}
           {{- if .Values.openTfMirror.command }}
           command:
             {{- toYaml .Values.openTfMirror.command | nindent 12 }}
@@ -74,25 +78,19 @@ spec:
           args:
             {{- toYaml $args | nindent 12 }}
           {{- end }}
-          {{- if .Values.openTfMirror.env }}
+          {{- if or .Values.openTfMirror.providersMirror.enabled .Values.openTfMirror.env }}
           env:
+            {{- if .Values.openTfMirror.providersMirror.enabled }}
+            - name: TF_PLUGIN_MIRROR_DIR
+              value: /usr/share/terraform/providers/plugins
+            {{- end }}
+            {{- with .Values.openTfMirror.env }}
             {{- toYaml .Values.openTfMirror.env | nindent 12 }}
+            {{- end }}
           {{- end }}
           {{- if .Values.openTfMirror.envFrom }}
           envFrom:
             {{- toYaml .Values.openTfMirror.envFrom | nindent 12 }}
-          {{- end }}
-          {{- if .Values.openTfMirror.providersMirror.enabled }}
-          lifecycle:
-            postStart:
-              exec:
-                command:
-                  - /bin/sh
-                  - -c
-                  - |
-                    set -e
-                    mkdir -p /usr/share/terraform/providers
-                    ln -s /proc/$(cat /pids/providers-mirror)/$(whoami)/usr/share/terraform/providers/plugins /usr/share/terraform/providers/
           {{- end }}
           {{- if .Values.openTfMirror.resources }}
           resources:
@@ -149,8 +147,8 @@ spec:
               readOnly: true
             {{- end }}
             {{- if .Values.openTfMirror.providersMirror.enabled }}
-            - name: pids
-              mountPath: /pids
+            - name: providers-mirror
+              mountPath: /usr/share/terraform/providers/plugins
               readOnly: true
             {{- end }}
       volumes:
@@ -164,7 +162,7 @@ spec:
             secretName: {{ .Values.openTfMirror.tls.secretName }}
         {{- end }}
         {{- if .Values.openTfMirror.providersMirror.enabled }}
-        - name: pids
+        - name: providers-mirror
           emptyDir: {}
         {{- end }}
   {{- if .Values.openTfMirror.pvc.enabled }}
@@ -176,7 +174,7 @@ spec:
           {{- toYaml .Values.commonAnnotations | nindent 10 }}
         {{- end }}
         labels:
-          {{- include "open-tf-mirror.selectorLabels" . | nindent 10 }}
+          {{- include "open-tf-mirror.labels" . | nindent 10 }}
       spec:
         {{- $storageClass := include "open-tf-mirror.storageClass" (dict "Values" .Values "pvc" .Values.openTfMirror.pvc) }}
         {{- if $storageClass }}

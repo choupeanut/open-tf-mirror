@@ -1,5 +1,5 @@
 apiVersion: v2
-appVersion: 0.1.0
+appVersion: 0.2.0
 description: A Helm chart for open-tf-mirror.
 home: https://github.com/choupeanut/open-tf-mirror
 keywords:
@@ -10,7 +10,7 @@ name: open-tf-mirror
 sources:
   - https://github.com/choupeanut/open-tf-mirror
 type: application
-version: 0.1.6
+version: 0.2.0
 annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/links: |

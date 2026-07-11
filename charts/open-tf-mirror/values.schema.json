@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "imageRegistry": { "type": "string" },
+        "imagePullSecrets": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "object" }
+            ]
+          }
+        },
+        "storageClass": { "type": "string" }
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "namespaceOverride": { "type": "string" },
+    "commonAnnotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "commonLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "openTfMirror": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "replicas",
+        "image",
+        "podSecurityContext",
+        "containerSecurityContext",
+        "command",
+        "args",
+        "env",
+        "envFrom",
+        "resources",
+        "startupProbe",
+        "readinessProbe",
+        "livenessProbe",
+        "pdb",
+        "service",
+        "pvc",
+        "tls",
+        "providersMirror"
+      ],
+      "properties": {
+        "replicas": { "type": "integer", "minimum": 0 },
+        "image": { "$ref": "#/definitions/image" },
+        "podSecurityContext": { "type": "object" },
+        "containerSecurityContext": { "type": "object" },
+        "command": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "env": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "envFrom": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "resources": { "type": "object" },
+        "startupProbe": { "$ref": "#/definitions/startupProbe" },
+        "readinessProbe": { "$ref": "#/definitions/toggleProbe" },
+        "livenessProbe": { "$ref": "#/definitions/toggleProbe" },
+        "pdb": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minAvailable": { "$ref": "#/definitions/intOrString" },
+            "maxUnavailable": { "$ref": "#/definitions/intOrString" }
+          }
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "type": "string" },
+            "ports": { "$ref": "#/definitions/ports" },
+            "targetPorts": { "$ref": "#/definitions/ports" },
+            "sessionAffinity": { "type": "string" },
+            "sessionAffinityConfig": { "type": "object" }
+          }
+        },
+        "pvc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "subPath": { "type": "string" },
+            "storageClass": { "type": "string" },
+            "accessModes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "size": { "$ref": "#/definitions/intOrString" }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "domainName", "secretName"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "domainName": { "type": "string" },
+            "secretName": { "type": "string" }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              },
+              "then": {
+                "properties": {
+                  "secretName": { "type": "string", "minLength": 1 }
+                },
+                "required": ["secretName"]
+              }
+            }
+          ]
+        },
+        "providersMirror": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": { "$ref": "#/definitions/image" }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "intOrString": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "minLength": 1 }
+      ]
+    },
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http", "https"],
+      "properties": {
+        "http": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "https": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "probeFields": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "startupProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "toggleProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

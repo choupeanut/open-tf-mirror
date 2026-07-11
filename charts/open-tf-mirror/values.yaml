@@ -14,9 +14,25 @@ openTfMirror:
   replicas: 1
 
   image:
-    repository: choupeanut/open-tf-mirror
-    tag: 0.1.0
+    repository: peanutchou/open-tf-mirror
+    tag: 0.2.0
     pullPolicy: IfNotPresent
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
 
   command:
     - open-tf-mirror
@@ -77,7 +93,7 @@ openTfMirror:
     size: 1Gi
 
   tls:
-    enabled: true
+    enabled: false
     domainName: ""
     secretName: ""
 

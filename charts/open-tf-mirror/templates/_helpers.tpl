@@ -73,17 +73,18 @@ Common labels.
 {{- define "open-tf-mirror.labels" -}}
 helm.sh/chart: {{ include "open-tf-mirror.chart" . }}
 app.kubernetes.io/part-of: open-tf-mirror
-app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with omit .Values.commonLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" }}
+{{ toYaml . }}
+{{- end }}
+{{ include "open-tf-mirror.matchLabels" . }}
 {{- end -}}
 
 {{/*
-Selector labels.
+Stable labels used by immutable workload selectors.
 */}}
-{{- define "open-tf-mirror.selectorLabels" -}}
-{{ include "open-tf-mirror.labels" . }}
+{{- define "open-tf-mirror.matchLabels" -}}
+app.kubernetes.io/name: {{ include "open-tf-mirror.commonName" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: server
-{{- if .Values.commonLabels }}
-{{ toYaml .Values.commonLabels }}
-{{- end }}
 {{- end -}}

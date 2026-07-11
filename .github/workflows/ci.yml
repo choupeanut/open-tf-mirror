@@ -8,8 +8,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_REPOSITORY: open-tf-mirror
-  IMAGE_TAG: 0.1.0
+  IMAGE_REPOSITORY: peanutchou/open-tf-mirror
 
 jobs:
   rust:
@@ -20,9 +19,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
+      - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies
@@ -37,41 +37,84 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit
+
   container:
     name: Docker build and publish
     runs-on: ubuntu-latest
-    needs: rust
+    needs:
+      - rust
+      - helm
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Docker image
+      - name: Validate release versions
+        id: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         run: |
-          IMAGE_NAME="${DOCKERHUB_USERNAME}/${IMAGE_REPOSITORY}"
-          docker build \
-            --tag "$IMAGE_NAME:$IMAGE_TAG" \
-            --tag "$IMAGE_NAME:sha-${GITHUB_SHA}" \
-            --tag "$IMAGE_NAME:main" \
-            .
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Release tag must match vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          chart_version="$(sed -n 's/^version: //p' charts/open-tf-mirror/Chart.yaml)"
+          app_version="$(sed -n 's/^appVersion: //p' charts/open-tf-mirror/Chart.yaml)"
+          image_version="$(sed -n '/^  image:$/,/^  [a-zA-Z]/{s/^    tag: //p}' charts/open-tf-mirror/values.yaml | head -1)"
+          for release_version in "$cargo_version" "$chart_version" "$app_version" "$image_version"; do
+            test "$release_version" = "$version" || {
+              echo "Release versions must all match tag $GITHUB_REF_NAME" >&2
+              exit 1
+            }
+          done
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^FROM rust:1\.88-slim-bookworm@sha256:[a-f0-9]{64} AS builder$' Dockerfile
+          grep -Eq '^FROM debian:bookworm-slim@sha256:[a-f0-9]{64} AS runtime$' Dockerfile
+          ! grep -Eq 'apt-get|useradd|groupadd' Dockerfile
+          local_tag="$IMAGE_REPOSITORY:test-$GITHUB_SHA"
+          docker build --tag "$local_tag" .
+          if [[ -n "$RELEASE_VERSION" ]]; then
+            docker tag "$local_tag" "$IMAGE_REPOSITORY:$RELEASE_VERSION"
+            docker tag "$local_tag" "$IMAGE_REPOSITORY:sha-$GITHUB_SHA"
+          fi
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || github.repository_owner }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
 
       - name: Login to Docker Hub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: startsWith(github.ref, 'refs/tags/v')
         run: echo "${{ secrets.DOCKERHUB_PAT }}" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || github.repository_owner }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || 'peanutchou' }}
+
+      - name: Reject existing immutable tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in "${{ steps.release.outputs.version }}" "sha-$GITHUB_SHA"; do
+            if docker manifest inspect "$IMAGE_REPOSITORY:$tag" >/dev/null 2>&1; then
+              echo "Refusing to overwrite existing image tag $IMAGE_REPOSITORY:$tag" >&2
+              exit 1
+            fi
+          done
 
       - name: Push Docker image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          IMAGE_NAME="${DOCKERHUB_USERNAME}/${IMAGE_REPOSITORY}"
-          docker push "$IMAGE_NAME:$IMAGE_TAG"
-          docker push "$IMAGE_NAME:sha-${GITHUB_SHA}"
-          docker push "$IMAGE_NAME:main"
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME || github.repository_owner }}
+          docker push "$IMAGE_REPOSITORY:${{ steps.release.outputs.version }}"
+          docker push "$IMAGE_REPOSITORY:sha-$GITHUB_SHA"
 
   helm:
     name: Helm chart
@@ -89,13 +132,59 @@ jobs:
       - name: Lint chart
         run: helm lint charts/open-tf-mirror
 
+      - name: Verify hardened default render
+        run: |
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --namespace open-tf-mirror \
+            >/tmp/open-tf-mirror-default.yaml
+          grep -q 'image: peanutchou/open-tf-mirror:0.2.0$' /tmp/open-tf-mirror-default.yaml
+          grep -q '^      initContainers:$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'runAsUser: 10001$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'runAsGroup: 10001$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'fsGroup: 10001$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'readOnlyRootFilesystem: true$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'seccompProfile:$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'type: RuntimeDefault$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'drop:$' /tmp/open-tf-mirror-default.yaml
+          grep -q -- '- ALL$' /tmp/open-tf-mirror-default.yaml
+          ! grep -q 'shareProcessNamespace:' /tmp/open-tf-mirror-default.yaml
+          ! grep -q 'sleep infinity' /tmp/open-tf-mirror-default.yaml
+          ! grep -q '/proc/$(cat /pids/providers-mirror)' /tmp/open-tf-mirror-default.yaml
+          grep -q 'cp -R /usr/share/terraform/providers/plugins/. /providers-mirror/' /tmp/open-tf-mirror-default.yaml
+          grep -q 'name: TF_PLUGIN_MIRROR_DIR$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'value: /usr/share/terraform/providers/plugins$' /tmp/open-tf-mirror-default.yaml
+          cp -R charts/open-tf-mirror /tmp/open-tf-mirror-upgrade
+          sed -i 's/^version: 0.2.0$/version: 9.9.9/' /tmp/open-tf-mirror-upgrade/Chart.yaml
+          helm template open-tf-mirror /tmp/open-tf-mirror-upgrade \
+            --namespace open-tf-mirror \
+            --set commonLabels.upgrade-probe=changed \
+            >/tmp/open-tf-mirror-upgrade.yaml
+          awk '$0 == "kind: StatefulSet" { statefulset=1 } statefulset && $0 == "  selector:" { selector=1 } selector { print } selector && $0 == "  template:" { exit }' \
+            /tmp/open-tf-mirror-default.yaml | sed '$d' \
+            >/tmp/open-tf-mirror-selector-before.yaml
+          awk '$0 == "kind: StatefulSet" { statefulset=1 } statefulset && $0 == "  selector:" { selector=1 } selector { print } selector && $0 == "  template:" { exit }' \
+            /tmp/open-tf-mirror-upgrade.yaml | sed '$d' \
+            >/tmp/open-tf-mirror-selector-after.yaml
+          cmp /tmp/open-tf-mirror-selector-before.yaml /tmp/open-tf-mirror-selector-after.yaml
+          grep -q 'app.kubernetes.io/name: open-tf-mirror$' /tmp/open-tf-mirror-selector-before.yaml
+          grep -q 'app.kubernetes.io/instance: open-tf-mirror$' /tmp/open-tf-mirror-selector-before.yaml
+          grep -q 'app.kubernetes.io/component: server$' /tmp/open-tf-mirror-selector-before.yaml
+          ! grep -q 'helm.sh/chart:' /tmp/open-tf-mirror-selector-before.yaml
+          ! grep -q 'upgrade-probe:' /tmp/open-tf-mirror-selector-before.yaml
+          if helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.tls.enabled=true \
+            >/dev/null 2>&1; then
+            echo "TLS must require openTfMirror.tls.secretName" >&2
+            exit 1
+          fi
+
       - name: Render chart with Argo CD values shape
         run: |
           helm template open-tf-mirror charts/open-tf-mirror \
             --namespace open-tf-mirror \
             --set fullnameOverride=open-tf-mirror \
-            --set openTfMirror.image.repository=choupeanut/open-tf-mirror \
-            --set openTfMirror.image.tag=0.1.0 \
+            --set openTfMirror.image.repository=peanutchou/open-tf-mirror \
+            --set openTfMirror.image.tag=0.2.0 \
             --set openTfMirror.replicas=2 \
             --set openTfMirror.args[0]=--log-debug \
             --set openTfMirror.args[1]=--log-verbosity=4 \

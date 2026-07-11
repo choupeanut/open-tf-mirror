@@ -8,7 +8,7 @@ This chart installs [choupeanut/open-tf-mirror](https://github.com/choupeanut/op
 fullnameOverride: open-tf-mirror
 openTfMirror:
   image:
-    tag: v0.1.7
+    tag: 0.2.0
   args: []
   tls:
     enabled: true
@@ -30,7 +30,9 @@ With `fullnameOverride: open-tf-mirror`, resource names are:
 | Headless Service | `open-tf-mirror-headless` |
 | PVC template | `data` |
 
-The TLS secret from `openTfMirror.tls.secretName` is mounted at `/etc/open-tf-mirror/ssl`, and persistent data is mounted at `/var/run/open-tf-mirror`.
+The TLS secret from `openTfMirror.tls.secretName` is mounted at `/etc/open-tf-mirror/ssl`, and persistent data is mounted at `/var/run/open-tf-mirror`. Enabling TLS requires a non-empty existing Secret name.
+
+The server and provider-copy init container run without privilege under UID/GID `10001`. The server root filesystem is read-only; the PVC is its only writable runtime mount. When `openTfMirror.providersMirror.enabled` is true, the init container copies bundled providers into an `emptyDir` that is mounted read-only into the server and exposed through `TF_PLUGIN_MIRROR_DIR`.
 
 ## Values
 
@@ -38,10 +40,10 @@ The TLS secret from `openTfMirror.tls.secretName` is mounted at `/etc/open-tf-mi
 | --- | --- | --- |
 | `fullnameOverride` | `""` | Fully override the release base name. |
 | `openTfMirror.replicas` | `1` | Number of pods. |
-| `openTfMirror.image.repository` | `choupeanut/open-tf-mirror` | Image repository. |
-| `openTfMirror.image.tag` | `0.1.0` | Image tag. |
+| `openTfMirror.image.repository` | `peanutchou/open-tf-mirror` | Image repository. |
+| `openTfMirror.image.tag` | `0.2.0` | Image tag. |
 | `openTfMirror.args` | `["--log-debug", "--log-verbosity=4"]` | Container args. |
-| `openTfMirror.tls.enabled` | `true` | Enable TLS settings. |
+| `openTfMirror.tls.enabled` | `false` | Enable TLS using an existing Secret. |
 | `openTfMirror.tls.domainName` | `""` | Domain for auto-cert argument. |
 | `openTfMirror.tls.secretName` | `""` | Existing TLS secret to mount. |
 | `openTfMirror.resources` | `{}` | Container requests and limits. |

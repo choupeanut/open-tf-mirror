@@ -10,7 +10,7 @@ metadata:
     {{- toYaml .Values.commonAnnotations | nindent 4 }}
   {{- end }}
   labels:
-    {{- include "open-tf-mirror.selectorLabels" . | nindent 4 }}
+    {{- include "open-tf-mirror.labels" . | nindent 4 }}
 spec:
   {{- if .Values.openTfMirror.pdb.minAvailable }}
   minAvailable: {{ .Values.openTfMirror.pdb.minAvailable }}
@@ -20,5 +20,5 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- include "open-tf-mirror.selectorLabels" . | nindent 6 }}
+      {{- include "open-tf-mirror.matchLabels" . | nindent 6 }}
 {{- end }}
