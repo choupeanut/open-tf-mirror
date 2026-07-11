@@ -1,7 +1,7 @@
 use axum::body::Body;
 use http::{Request, StatusCode};
 use open_tf_mirror::{
-    http_api::{AppState, build_router},
+    http_api::{AppState, RouterOptions, build_router, build_router_with_options},
     metadata::{PlatformMetadata, ProviderMetadataStore, VersionMetadata},
     storage::ProviderStorage,
 };
@@ -14,7 +14,8 @@ use wiremock::{
 
 #[tokio::test]
 async fn health_endpoints_are_compatible_with_existing_probes() {
-    let app = build_router(AppState::for_tests(tempfile::tempdir().unwrap().path()));
+    let tmp = tempfile::tempdir().unwrap();
+    let app = build_router(AppState::for_tests(tmp.path()));
 
     for path in ["/readyz", "/livez"] {
         let response = app
@@ -25,6 +26,69 @@ async fn health_endpoints_are_compatible_with_existing_probes() {
 
         assert_eq!(response.status(), StatusCode::OK);
     }
+}
+
+#[tokio::test]
+async fn readiness_fails_when_data_directory_disappears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = build_router(AppState::for_tests(tmp.path()));
+    fs::remove_dir_all(tmp.path()).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn module_mirror_is_disabled_by_default() {
+    let app = build_router(AppState::for_tests(tempfile::tempdir().unwrap().path()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/modules/hashicorp/consul/aws/0.0.1/download")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn provider_api_enforces_configured_burst_limit() {
+    let app = build_router_with_options(
+        AppState::for_tests(tempfile::tempdir().unwrap().path()),
+        RouterOptions {
+            conn_qps: 1,
+            conn_burst: 1,
+            ..RouterOptions::default()
+        },
+    );
+    let request = || {
+        Request::builder()
+            .uri("/v1/providers/registry.terraform.io/hashicorp/random/index.txt")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.oneshot(request()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 #[tokio::test]
@@ -43,6 +107,7 @@ async fn provider_index_json_returns_versions_object() {
         provider_storage: ProviderStorage::new(tmp.path()),
         module_cache: open_tf_mirror::module_mirror::ModuleCache::new(tmp.path()),
         module_registry_base: "https://registry.terraform.io".into(),
+        data_dir: std::sync::Arc::new(tmp.path().to_path_buf()),
     });
 
     let response = app
@@ -93,7 +158,7 @@ async fn provider_version_json_returns_relative_download_archives() {
             os: "linux".into(),
             arch: "amd64".into(),
             filename: "terraform-provider-random_3.6.2_linux_amd64.zip".into(),
-            shasum: Some("abc123".into()),
+            shasum: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
             download_url: "https://releases.hashicorp.com/example.zip".into(),
         }],
     });
@@ -102,6 +167,7 @@ async fn provider_version_json_returns_relative_download_archives() {
         provider_storage: ProviderStorage::new(tmp.path()),
         module_cache: open_tf_mirror::module_mirror::ModuleCache::new(tmp.path()),
         module_registry_base: "https://registry.terraform.io".into(),
+        data_dir: std::sync::Arc::new(tmp.path().to_path_buf()),
     });
 
     let response = app
@@ -123,7 +189,10 @@ async fn provider_version_json_returns_relative_download_archives() {
         json["archives"]["linux_amd64"]["url"],
         "download/terraform-provider-random_3.6.2_linux_amd64.zip"
     );
-    assert_eq!(json["archives"]["linux_amd64"]["hashes"][0], "zh:abc123");
+    assert_eq!(
+        json["archives"]["linux_amd64"]["hashes"][0],
+        "zh:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
 }
 
 #[tokio::test]
@@ -147,7 +216,7 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
     let storage = ProviderStorage::new(tmp.path());
     let archive = tmp
         .path()
-        .join("data/providers/registry.terraform.io/hashicorp/random")
+        .join("providers/registry.terraform.io/hashicorp/random")
         .join(filename);
     fs::create_dir_all(archive.parent().unwrap()).unwrap();
     fs::write(&archive, b"zip-body").unwrap();
@@ -156,6 +225,7 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
         provider_storage: storage,
         module_cache: open_tf_mirror::module_mirror::ModuleCache::new(tmp.path()),
         module_registry_base: "https://registry.terraform.io".into(),
+        data_dir: std::sync::Arc::new(tmp.path().to_path_buf()),
     });
 
     let response = app
@@ -204,7 +274,13 @@ async fn module_download_fetches_from_registry_when_local_cache_is_missing() {
 
     let mut state = AppState::for_tests(tmp.path());
     state.module_registry_base = registry.uri();
-    let app = build_router(state);
+    let app = build_router_with_options(
+        state,
+        RouterOptions {
+            enable_module_mirror: true,
+            ..RouterOptions::default()
+        },
+    );
 
     let response = app
         .oneshot(

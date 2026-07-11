@@ -55,7 +55,7 @@ async fn provider_storage_uses_terraform_mirror_compatible_layout() {
     assert_eq!(
         path,
         tmp.path()
-            .join("data/providers/registry.terraform.io/hashicorp/random/terraform-provider-random_3.6.2_linux_amd64.zip")
+            .join("providers/registry.terraform.io/hashicorp/random/terraform-provider-random_3.6.2_linux_amd64.zip")
     );
 }
 

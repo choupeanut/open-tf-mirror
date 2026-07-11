@@ -49,6 +49,19 @@ fn new_rejects_malformed_certificate_or_key() {
 }
 
 #[test]
+fn new_rejects_certificate_and_private_key_that_do_not_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cert_pair(tmp.path(), "first");
+    write_cert_pair(tmp.path(), "second");
+
+    let error =
+        ReloadingCertResolver::new(tmp.path().join("first.crt"), tmp.path().join("second.key"))
+            .expect_err("a certificate and unrelated private key must be rejected");
+
+    assert!(error.to_string().contains("match"));
+}
+
+#[test]
 fn reloading_cert_files_changes_future_resolved_certificate() {
     let tmp = tempfile::tempdir().unwrap();
     let first_cert = write_cert_pair(tmp.path(), "first");

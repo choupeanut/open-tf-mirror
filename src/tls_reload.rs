@@ -1,6 +1,4 @@
 use std::{
-    fs::File,
-    io::BufReader,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -10,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use parking_lot::RwLock;
 use rustls::{
     crypto::aws_lc_rs::sign::any_supported_type,
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -85,22 +83,16 @@ impl ResolvesServerCert for ReloadingCertResolver {
 }
 
 fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
-    let cert_file = File::open(cert_path)
-        .with_context(|| format!("open TLS certificate {}", cert_path.display()))?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("open TLS certificate {}", cert_path.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("parse TLS certificate {}", cert_path.display()))?;
     if certs.is_empty() {
         bail!("TLS certificate file did not contain a certificate chain");
     }
 
-    let key_file = File::open(key_path)
-        .with_context(|| format!("open TLS private key {}", key_path.display()))?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("parse TLS private key {}", key_path.display()))?
-        .context("TLS private key file did not contain a supported key")?;
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .with_context(|| format!("parse TLS private key {}", key_path.display()))?;
 
     build_certified_key(certs, key)
 }
@@ -110,5 +102,9 @@ fn build_certified_key(
     key: PrivateKeyDer<'static>,
 ) -> Result<CertifiedKey> {
     let signing_key = any_supported_type(&key).context("unsupported TLS private key type")?;
-    Ok(CertifiedKey::new(certs, signing_key))
+    let certified_key = CertifiedKey::new(certs, signing_key);
+    certified_key
+        .keys_match()
+        .context("TLS certificate and private key do not match")?;
+    Ok(certified_key)
 }
