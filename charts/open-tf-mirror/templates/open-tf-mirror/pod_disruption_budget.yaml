@@ -1,3 +1,7 @@
+{{- $pdb := .Values.openTfMirror.pdb }}
+{{- if and (hasKey $pdb "minAvailable") (hasKey $pdb "maxUnavailable") }}
+{{- fail "openTfMirror.pdb.minAvailable and openTfMirror.pdb.maxUnavailable are mutually exclusive" }}
+{{- end }}
 {{- $replicas := int .Values.openTfMirror.replicas }}
 {{- if and .Values.openTfMirror.pdb.enabled (gt $replicas 1) }}
 apiVersion: policy/v1
@@ -12,11 +16,12 @@ metadata:
   labels:
     {{- include "open-tf-mirror.labels" . | nindent 4 }}
 spec:
-  {{- if .Values.openTfMirror.pdb.minAvailable }}
-  minAvailable: {{ .Values.openTfMirror.pdb.minAvailable }}
-  {{- end }}
-  {{- if .Values.openTfMirror.pdb.maxUnavailable }}
-  maxUnavailable: {{ .Values.openTfMirror.pdb.maxUnavailable }}
+  {{- if hasKey $pdb "minAvailable" }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else if hasKey $pdb "maxUnavailable" }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- else }}
+  minAvailable: 1
   {{- end }}
   selector:
     matchLabels:

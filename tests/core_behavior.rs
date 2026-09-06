@@ -20,6 +20,20 @@ fn parses_upstream_compatible_provider_archive_names() {
     assert_eq!(parsed.os, "linux");
     assert_eq!(parsed.arch, "amd64");
 
+    let prerelease = ArchiveName::parse(
+        "random",
+        "terraform-provider-random_1.0.0-beta.1_linux_amd64.zip",
+    )
+    .expect("semantic-version prerelease archives should parse");
+    assert_eq!(prerelease.version, "1.0.0-beta.1");
+
+    let build = ArchiveName::parse(
+        "random",
+        "terraform-provider-random_1.0.0+build.7_linux_amd64.zip",
+    )
+    .expect("semantic-version build metadata archives should parse");
+    assert_eq!(build.version, "1.0.0+build.7");
+
     let dashed = ArchiveName::parse(
         "teleport",
         "terraform-provider-teleport-v14.3.3-darwin-arm64-bin.zip",
@@ -109,4 +123,32 @@ async fn module_cache_fetches_official_source_when_missing() {
 
     assert!(resolved.fetched);
     assert_eq!(fs::read(resolved.path).unwrap(), b"remote-module");
+}
+
+#[tokio::test]
+async fn module_cache_rejects_path_traversal_and_non_http_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = ModuleCache::new(tmp.path());
+    let mut id = ModuleId {
+        hostname: "registry.terraform.io".into(),
+        namespace: "terraform-aws-modules".into(),
+        name: "vpc".into(),
+        system: "aws".into(),
+        version: "../outside".into(),
+    };
+
+    assert!(
+        cache
+            .load_or_fetch(&id, "https://example.invalid/module.tar.gz")
+            .await
+            .is_err()
+    );
+
+    id.version = "5.8.1".into();
+    assert!(
+        cache
+            .load_or_fetch(&id, "git::https://github.com/example/module")
+            .await
+            .is_err()
+    );
 }

@@ -78,7 +78,7 @@ The chart lives at `charts/open-tf-mirror` and can be consumed directly from an
 immutable Git tag. The runtime and provider-copy init container use UID/GID
 `10001`; the server has a read-only root filesystem and writes only to its PVC.
 TLS is disabled by default. Enabling it requires an existing Secret through
-`openTfMirror.tls.secretName`.
+`openTfMirror.tls.secretName`; the chart does not issue ACME certificates.
 
 See [the chart README](charts/open-tf-mirror/README.md) for values and rendered
 resource names.
@@ -97,14 +97,17 @@ Run the real Terraform TLS/cache smoke test as well:
 RUN_E2E=1 ./scripts/verify.sh
 ```
 
-The smoke test performs one online `terraform init`, restarts the mirror with an
-unreachable upstream proxy, deletes Terraform's local plugin cache, and proves a
-second init succeeds without changing the cached archive.
+The smoke test performs one online `terraform init`, restarts the mirror on a
+network-isolated Docker network, deletes Terraform's local plugin cache, and
+proves a second init succeeds without allowing the mirror to reach the upstream
+registry. `RUN_E2E=1` therefore requires Docker and the image built by the
+verification script, plus `openssl`, `curl`, `jq`, `socat`, and Terraform on
+the host.
 
 ## Consumer migration
 
-The consumer repositories have **not** been changed. Future agents must follow
-these reviewed instructions:
+The consumer repositories have **not** been changed by this repository. The
+reviewed migration runbooks are:
 
 - [`cloud-infra-argocd-apps`](docs/migration/cloud-infra-argocd-apps.md)
 - [`cloud-infra-terragrunt-terraform`](docs/migration/cloud-infra-terragrunt-terraform.md)

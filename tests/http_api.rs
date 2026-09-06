@@ -209,7 +209,7 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
             os: "linux".into(),
             arch: "amd64".into(),
             filename: filename.into(),
-            shasum: None,
+            shasum: Some("4880130a58b9b6c31a056e79db0dc17e8bbfb1e0ac4da3ede76788cc27d74014".into()),
             download_url: "https://releases.hashicorp.com/example.zip".into(),
         }],
     });

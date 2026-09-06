@@ -17,7 +17,7 @@ use axum::{
 };
 use clap::{ArgAction, Parser};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
 use open_tf_mirror::{
@@ -29,14 +29,25 @@ use open_tf_mirror::{
 };
 use rustls::ServerConfig;
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
     task::JoinSet,
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTPS_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy)]
+struct HttpsServeOptions {
+    handshake_timeout: Duration,
+    shutdown_grace_period: Duration,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "open-tf-mirror", version)]
@@ -246,7 +257,31 @@ async fn serve_https(
     key_path: PathBuf,
     app: Router,
     conn_burst: usize,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    serve_https_with_timeouts(
+        addr,
+        cert_path,
+        key_path,
+        app,
+        conn_burst,
+        shutdown,
+        HttpsServeOptions {
+            handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+            shutdown_grace_period: HTTPS_SHUTDOWN_GRACE_PERIOD,
+        },
+    )
+    .await
+}
+
+async fn serve_https_with_timeouts(
+    addr: SocketAddr,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    app: Router,
+    conn_burst: usize,
     mut shutdown: watch::Receiver<bool>,
+    options: HttpsServeOptions,
 ) -> Result<()> {
     let resolver = ReloadingCertResolver::new(cert_path, key_path)?;
     let mut config = ServerConfig::builder()
@@ -271,40 +306,80 @@ async fn serve_https(
             }
             accepted = listener.accept() => accepted.context("accept TLS connection")?,
         };
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .context("connection limiter closed")?;
+        let permit = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            permit = semaphore.clone().acquire_owned() => {
+                permit.context("connection limiter closed")?
+            }
+        };
         let (stream, peer_addr) = accepted;
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let connection_shutdown = shutdown.clone();
         connections.spawn(async move {
             let _permit = permit;
-            let Ok(stream) = acceptor.accept(stream).await else {
-                tracing::debug!(%peer_addr, "TLS handshake failed");
+            let Some(stream) = accept_tls_with_timeout(
+                &acceptor,
+                stream,
+                connection_shutdown,
+                options.handshake_timeout,
+            )
+            .await
+            else {
+                tracing::debug!(%peer_addr, "TLS handshake failed, timed out, or was cancelled");
                 return;
             };
             let io = TokioIo::new(stream);
             let service = TowerToHyperService::new(app);
-            if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await
-            {
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .header_read_timeout(HTTP_IDLE_TIMEOUT)
+                .timer(TokioTimer::new());
+            builder
+                .http2()
+                .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+                .keep_alive_timeout(HTTP_IDLE_TIMEOUT)
+                .timer(TokioTimer::new());
+            if let Err(err) = builder.serve_connection(io, service).await {
                 tracing::debug!(%peer_addr, error = %err, "HTTPS connection failed");
             }
         });
         while connections.try_join_next().is_some() {}
     }
 
-    let drained = tokio::time::timeout(Duration::from_secs(15), async {
+    let drained = tokio::time::timeout(options.shutdown_grace_period, async {
         while connections.join_next().await.is_some() {}
     })
     .await;
     if drained.is_err() {
         connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
     Ok(())
+}
+
+async fn accept_tls_with_timeout(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+    mut shutdown: watch::Receiver<bool>,
+    handshake_timeout: Duration,
+) -> Option<TlsStream<TcpStream>> {
+    tokio::select! {
+        _ = shutdown_requested(&mut shutdown) => None,
+        result = tokio::time::timeout(handshake_timeout, acceptor.accept(stream)) => {
+            result.ok().and_then(Result::ok)
+        }
+    }
+}
+
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
 }
 
 async fn redirect_http_to_https(
@@ -375,9 +450,36 @@ async fn wait_for_shutdown_signal(shutdown: watch::Sender<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::{fs, path::Path, sync::Arc};
 
-    use super::{Args, bind_addr, install_crypto_provider, redirect_location};
+    use clap::Parser;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::ServerConfig;
+    use tokio::{net::TcpListener, sync::watch, time::timeout};
+    use tokio_rustls::TlsAcceptor;
+
+    use super::{
+        Args, ReloadingCertResolver, accept_tls_with_timeout, bind_addr, install_crypto_provider,
+        redirect_location,
+    };
+
+    fn test_tls_acceptor(dir: &Path) -> TlsAcceptor {
+        let resolver =
+            ReloadingCertResolver::new(dir.join("tls.crt"), dir.join("tls.key")).unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    fn write_test_tls_pair() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        fs::write(dir.path().join("tls.crt"), cert.pem()).unwrap();
+        fs::write(dir.path().join("tls.key"), signing_key.serialize_pem()).unwrap();
+        dir
+    }
 
     #[test]
     fn cli_defaults_to_unprivileged_container_ports() {
@@ -432,5 +534,60 @@ mod tests {
     fn crypto_provider_installation_is_idempotent() {
         install_crypto_provider().unwrap();
         install_crypto_provider().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_times_out_without_client_input() {
+        install_crypto_provider().unwrap();
+        let dir = write_test_tls_pair();
+        let acceptor = test_tls_acceptor(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_tls_with_timeout(
+                &acceptor,
+                stream,
+                shutdown_rx,
+                std::time::Duration::from_millis(25),
+            )
+            .await
+        });
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let result = timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_is_cancelled_when_shutdown_is_requested() {
+        install_crypto_provider().unwrap();
+        let dir = write_test_tls_pair();
+        let acceptor = test_tls_acceptor(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_tls_with_timeout(
+                &acceptor,
+                stream,
+                shutdown_rx,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+        });
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        shutdown_tx.send(true).unwrap();
+
+        let result = timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_none());
     }
 }

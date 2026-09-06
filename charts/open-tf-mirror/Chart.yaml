@@ -5,7 +5,7 @@ home: https://github.com/choupeanut/open-tf-mirror
 keywords:
   - terraform provider mirror
   - open-tf-mirror
-kubeVersion: ">=1.19.0-0"
+kubeVersion: ">=1.21.0-0"
 name: open-tf-mirror
 sources:
   - https://github.com/choupeanut/open-tf-mirror

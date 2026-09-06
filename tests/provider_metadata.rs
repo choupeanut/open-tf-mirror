@@ -1,4 +1,4 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, fs, time::Duration};
 
 use open_tf_mirror::{
     metadata::{MetadataError, ProviderMetadataService},
@@ -166,6 +166,117 @@ async fn stale_version_packages_survive_restart_and_origin_failure() {
         .unwrap();
 
     assert_eq!(stale.platforms[0].shasum.as_deref(), Some(VALID_SHA256));
+}
+
+#[tokio::test]
+async fn concurrent_stale_refresh_failure_is_single_flight_and_serves_stale_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    mount_random(&server).await;
+    let service = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        ["registry.terraform.io"],
+        Duration::ZERO,
+        client(&server),
+    )
+    .unwrap();
+    service
+        .list_versions("registry.terraform.io", "hashicorp", "random")
+        .await
+        .unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/providers/hashicorp/random/versions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let (a, b, c, d) = tokio::join!(
+        service.list_versions("registry.terraform.io", "hashicorp", "random"),
+        service.list_versions("registry.terraform.io", "hashicorp", "random"),
+        service.list_versions("registry.terraform.io", "hashicorp", "random"),
+        service.list_versions("registry.terraform.io", "hashicorp", "random")
+    );
+
+    for result in [a, b, c, d] {
+        assert_eq!(result.unwrap(), vec!["3.6.2"]);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn corrupt_persisted_index_is_ignored_and_refetched() {
+    let temp = tempfile::tempdir().unwrap();
+    let index = temp
+        .path()
+        .join("metadata/registry.terraform.io/hashicorp/random/index.json");
+    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+    std::fs::write(&index, b"{not-json").unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/providers/hashicorp/random/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "versions": [{"version": "3.6.2", "platforms": []}]
+        })))
+        .mount(&server)
+        .await;
+
+    let service = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        ["registry.terraform.io"],
+        Duration::from_secs(1800),
+        client(&server),
+    )
+    .unwrap();
+    assert_eq!(
+        service
+            .list_versions("registry.terraform.io", "hashicorp", "random")
+            .await
+            .unwrap(),
+        vec!["3.6.2"]
+    );
+}
+
+#[tokio::test]
+async fn invalid_persisted_index_is_ignored_and_refetched() {
+    let temp = tempfile::tempdir().unwrap();
+    let index = temp
+        .path()
+        .join("metadata/registry.terraform.io/hashicorp/random/index.json");
+    std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+    std::fs::write(
+        &index,
+        serde_json::json!({
+            "fetched_at": 0,
+            "value": [{"version": "../escape", "platforms": []}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/providers/hashicorp/random/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "versions": [{"version": "3.6.2", "platforms": []}]
+        })))
+        .mount(&server)
+        .await;
+
+    let service = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        ["registry.terraform.io"],
+        Duration::from_secs(1800),
+        client(&server),
+    )
+    .unwrap();
+
+    assert_eq!(
+        service
+            .list_versions("registry.terraform.io", "hashicorp", "random")
+            .await
+            .unwrap(),
+        vec!["3.6.2"]
+    );
 }
 
 #[tokio::test]
@@ -524,6 +635,101 @@ async fn stale_metadata_remains_available_when_origin_fails() {
             .unwrap(),
         vec!["3.6.2"]
     );
+}
+
+#[tokio::test]
+async fn corrupt_persisted_version_is_ignored_and_refreshed() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    mount_random(&server).await;
+    let allowed = HashSet::from(["registry.terraform.io".to_string()]);
+    let service = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        allowed.clone(),
+        Duration::from_secs(1800),
+        client(&server),
+    )
+    .unwrap();
+    service
+        .get_version("registry.terraform.io", "hashicorp", "random", "3.6.2")
+        .await
+        .unwrap();
+    drop(service);
+
+    let version = temp
+        .path()
+        .join("metadata/registry.terraform.io/hashicorp/random/3.6.2.json");
+    fs::write(&version, b"{not-json").unwrap();
+    let restarted = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        allowed,
+        Duration::from_secs(1800),
+        client(&server),
+    )
+    .unwrap();
+
+    assert!(
+        restarted
+            .get_version("registry.terraform.io", "hashicorp", "random", "3.6.2")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn package_metadata_keeps_available_platforms_when_one_platform_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/providers/hashicorp/random/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "versions": [{
+                "version": "3.6.2",
+                "platforms": [
+                    {"os": "linux", "arch": "amd64"},
+                    {"os": "darwin", "arch": "amd64"}
+                ]
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/providers/hashicorp/random/3.6.2/download/linux/amd64",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "os": "linux",
+            "arch": "amd64",
+            "filename": "terraform-provider-random_3.6.2_linux_amd64.zip",
+            "download_url": "https://releases.example/random-linux.zip",
+            "shasum": VALID_SHA256
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/providers/hashicorp/random/3.6.2/download/darwin/amd64",
+        ))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let service = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        ["registry.terraform.io"],
+        Duration::from_secs(1800),
+        client(&server),
+    )
+    .unwrap();
+
+    let metadata = service
+        .get_version("registry.terraform.io", "hashicorp", "random", "3.6.2")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(metadata.platforms.len(), 1);
+    assert_eq!(metadata.platforms[0].os, "linux");
 }
 
 #[tokio::test]

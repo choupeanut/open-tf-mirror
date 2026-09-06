@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use reqwest::{Client, StatusCode, Url, header};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::lookup_host,
     sync::{Mutex, Semaphore},
 };
@@ -157,30 +157,77 @@ impl ProviderStorage {
                 "metadata filename does not match request".into(),
             ));
         }
+        let expected = expected_checksum(metadata)?;
 
         if let Some(path) = self.bundled_path(key)
-            && tokio::fs::metadata(&path).await.is_ok()
+            && self.archive_matches_checksum(&path, &expected).await?
         {
             return Ok(path);
         }
         let destination = self.archive_path(key);
-        if tokio::fs::metadata(&destination).await.is_ok() {
+        if self
+            .archive_matches_checksum(&destination, &expected)
+            .await?
+        {
             return Ok(destination);
         }
 
         let lock = self.lock_for(key);
         let _guard = lock.mutex.lock().await;
         if let Some(path) = self.bundled_path(key)
-            && tokio::fs::metadata(&path).await.is_ok()
+            && self.archive_matches_checksum(&path, &expected).await?
         {
             return Ok(path);
         }
-        if tokio::fs::metadata(&destination).await.is_ok() {
+        if self
+            .archive_matches_checksum(&destination, &expected)
+            .await?
+        {
             return Ok(destination);
         }
 
-        self.download(key, metadata, &destination).await?;
+        self.download(key, metadata, &expected, &destination)
+            .await?;
         Ok(destination)
+    }
+
+    async fn archive_matches_checksum(
+        &self,
+        path: &Path,
+        expected: &str,
+    ) -> Result<bool, ProviderStorageError> {
+        let metadata = match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(false);
+        }
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let length = file.metadata().await?.len();
+        if length > self.max_archive_bytes {
+            return Ok(false);
+        }
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > self.max_archive_bytes {
+                return Ok(false);
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()) == expected)
     }
 
     fn bundled_path(&self, key: &ProviderArchiveKey) -> Option<PathBuf> {
@@ -218,16 +265,9 @@ impl ProviderStorage {
         &self,
         key: &ProviderArchiveKey,
         metadata: &PlatformMetadata,
+        expected: &str,
         destination: &Path,
     ) -> Result<(), ProviderStorageError> {
-        let expected = metadata
-            .shasum
-            .as_deref()
-            .filter(|checksum| {
-                checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            .ok_or(ProviderStorageError::MissingChecksum)?
-            .to_ascii_lowercase();
         let url = Url::parse(&metadata.download_url)
             .map_err(|_| ProviderStorageError::InvalidKey("download URL".into()))?;
         let _permit = self
@@ -271,7 +311,10 @@ impl ProviderStorage {
         }
         let actual = hex::encode(hasher.finalize());
         if actual != expected {
-            return Err(ProviderStorageError::ChecksumMismatch { expected, actual });
+            return Err(ProviderStorageError::ChecksumMismatch {
+                expected: expected.to_string(),
+                actual,
+            });
         }
         file.sync_all().await?;
         drop(file);
@@ -403,6 +446,17 @@ fn validate_key(key: &ProviderArchiveKey) -> Result<(), ProviderStorageError> {
         ));
     }
     Ok(())
+}
+
+fn expected_checksum(metadata: &PlatformMetadata) -> Result<String, ProviderStorageError> {
+    metadata
+        .shasum
+        .as_deref()
+        .filter(|checksum| {
+            checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(str::to_ascii_lowercase)
+        .ok_or(ProviderStorageError::MissingChecksum)
 }
 
 fn valid_hostname(value: &str) -> bool {

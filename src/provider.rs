@@ -12,7 +12,7 @@ pub struct ArchiveName {
 impl ArchiveName {
     pub fn parse(route_type: &str, archive: &str) -> Result<Self> {
         let re = Regex::new(
-            r"^terraform-provider-(?P<type>[\w-]+)[_-](?P<version>[\w|\.]+)[_-](?P<os>[a-z]+)[_-](?P<arch>[a-z0-9]+)([_-].*)?\.zip$",
+            r"^terraform-provider-(?P<type>[\w-]+?)[_-](?P<version>v?[0-9A-Za-z][0-9A-Za-z.+-]*?)[_-](?P<os>[a-z]+)[_-](?P<arch>[a-z0-9]+)([_-].*)?\.zip$",
         )
         .expect("provider archive regex must compile");
 
@@ -27,7 +27,10 @@ impl ArchiveName {
 
         Ok(Self {
             provider_type,
-            version: captures["version"].trim_start_matches('v').to_string(),
+            version: captures["version"]
+                .strip_prefix('v')
+                .unwrap_or(&captures["version"])
+                .to_string(),
             os: captures["os"].to_string(),
             arch: captures["arch"].to_string(),
         })

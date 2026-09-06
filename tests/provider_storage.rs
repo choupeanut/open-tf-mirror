@@ -269,6 +269,65 @@ async fn cache_hit_does_not_contact_upstream() {
 }
 
 #[tokio::test]
+async fn corrupt_cached_archive_is_replaced_with_verified_download() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let body = b"verified replacement";
+    Mock::given(method("GET"))
+        .and(path("/provider.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+    let storage = ProviderStorage::new_for_tests(temp.path(), None::<&Path>, 1024 * 1024).unwrap();
+    let filename = "terraform-provider-random_3.6.2_linux_amd64.zip";
+    let archive = storage.archive_path(&key(filename));
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    fs::write(&archive, b"corrupt cached bytes").unwrap();
+    let metadata = metadata(format!("{}/provider.zip", server.uri()), body);
+
+    let resolved = storage
+        .load_or_fetch(&key(filename), &metadata)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved, archive);
+    assert_eq!(fs::read(resolved).unwrap(), body);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn corrupted_bundled_archive_does_not_hide_a_valid_persistent_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundled = tempfile::tempdir().unwrap();
+    let filename = "terraform-provider-random_3.6.2_linux_amd64.zip";
+    let bundled_archive = bundled
+        .path()
+        .join("registry.terraform.io/hashicorp/random")
+        .join(filename);
+    fs::create_dir_all(bundled_archive.parent().unwrap()).unwrap();
+    fs::write(&bundled_archive, b"corrupted bundled archive").unwrap();
+
+    let storage =
+        ProviderStorage::new_for_tests(temp.path(), Some(bundled.path()), 1024 * 1024).unwrap();
+    let persistent = storage.archive_path(&key(filename));
+    fs::create_dir_all(persistent.parent().unwrap()).unwrap();
+    fs::write(&persistent, b"valid persistent archive").unwrap();
+
+    let resolved = storage
+        .load_or_fetch(
+            &key(filename),
+            &metadata(
+                "https://releases.example/unused.zip".into(),
+                b"valid persistent archive",
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resolved, persistent);
+}
+
+#[tokio::test]
 async fn traversal_components_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let storage = ProviderStorage::new(temp.path());

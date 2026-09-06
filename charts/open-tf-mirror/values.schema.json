@@ -12,8 +12,15 @@
           "type": "array",
           "items": {
             "oneOf": [
-              { "type": "string" },
-              { "type": "object" }
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 }
+                }
+              }
             ]
           }
         },
@@ -81,6 +88,9 @@
         "pdb": {
           "type": "object",
           "additionalProperties": false,
+          "not": {
+            "required": ["minAvailable", "maxUnavailable"]
+          },
           "properties": {
             "enabled": { "type": "boolean" },
             "minAvailable": { "$ref": "#/definitions/intOrString" },

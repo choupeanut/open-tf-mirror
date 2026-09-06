@@ -10,7 +10,7 @@ metadata:
   labels:
     {{- include "open-tf-mirror.labels" . | nindent 4 }}
 spec:
-  serviceName: {{ include "open-tf-mirror.name" . }}-headless
+  serviceName: {{ include "open-tf-mirror.headlessName" . }}
   replicas: {{ .Values.openTfMirror.replicas }}
   selector:
     matchLabels:
@@ -30,11 +30,13 @@ spec:
         {{- toYaml .Values.openTfMirror.podSecurityContext | nindent 8 }}
       {{- if .Values.global.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+        {{- range .Values.global.imagePullSecrets }}
+        - name: {{ if kindIs "string" . }}{{ . | quote }}{{ else }}{{ .name | quote }}{{ end }}
+        {{- end }}
       {{- end }}
       {{- if .Values.openTfMirror.providersMirror.enabled }}
       initContainers:
-        - name: {{ include "open-tf-mirror.name" . }}-providers-mirror
+        - name: {{ include "open-tf-mirror.providersMirrorName" . }}
           image: {{ include "open-tf-mirror.image" (dict "Values" .Values "image" .Values.openTfMirror.providersMirror.image) }}
           imagePullPolicy: {{ .Values.openTfMirror.providersMirror.image.pullPolicy }}
           securityContext:
@@ -60,11 +62,20 @@ spec:
           command:
             {{- toYaml .Values.openTfMirror.command | nindent 12 }}
           {{- end }}
-          {{- $args := .Values.openTfMirror.args }}
-          {{- if not .Values.openTfMirror.tls.enabled }}
-          {{- $args = append $args "--enable-tls=false" }}
-          {{- else if .Values.openTfMirror.tls.secretName }}
+          {{- $args := deepCopy .Values.openTfMirror.args }}
           {{- $argsText := join " " $args }}
+          {{- if not (contains "--http-port" $argsText) }}
+          {{- $args = append $args (printf "--http-port=%d" (int .Values.openTfMirror.service.targetPorts.http)) }}
+          {{- end }}
+          {{- if not (contains "--https-port" $argsText) }}
+          {{- $args = append $args (printf "--https-port=%d" (int .Values.openTfMirror.service.targetPorts.https)) }}
+          {{- end }}
+          {{- $argsText = join " " $args }}
+          {{- if not .Values.openTfMirror.tls.enabled }}
+          {{- if not (contains "--enable-tls" $argsText) }}
+          {{- $args = append $args "--enable-tls=false" }}
+          {{- end }}
+          {{- else if .Values.openTfMirror.tls.secretName }}
           {{- if not (contains "--tls-cert-file" $argsText) }}
           {{- $args = append $args "--tls-cert-file=/etc/open-tf-mirror/ssl/tls.crt" }}
           {{- end }}
