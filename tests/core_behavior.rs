@@ -27,6 +27,15 @@ fn parses_upstream_compatible_provider_archive_names() {
     .expect("semantic-version prerelease archives should parse");
     assert_eq!(prerelease.version, "1.0.0-beta.1");
 
+    let simple_prerelease = ArchiveName::parse(
+        "random",
+        "terraform-provider-random_1.0.0-beta_linux_amd64.zip",
+    )
+    .expect("simple semantic-version prerelease archives should parse");
+    assert_eq!(simple_prerelease.version, "1.0.0-beta");
+    assert_eq!(simple_prerelease.os, "linux");
+    assert_eq!(simple_prerelease.arch, "amd64");
+
     let build = ArchiveName::parse(
         "random",
         "terraform-provider-random_1.0.0+build.7_linux_amd64.zip",
