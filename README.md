@@ -9,15 +9,21 @@ Pricer's infrastructure workflows while fixing custom TLS certificate rotation.
 - Implements `index.json`, version metadata, and archive download endpoints
   below `/v1/providers/`.
 - Fetches provider metadata from allowed origin registries and persists it for
-  30 minutes by default.
+  30 minutes by default. Partial platform results are retained and retried
+  after 30 seconds; a failed refresh never replaces valid data with an empty
+  response.
+- Refreshes a stale registry index once when a requested provider version is
+  missing, with a 30-second per-provider backoff.
 - Serves stale persisted metadata if an origin is temporarily unavailable.
+- Uses Terraform registry service discovery (`/.well-known/terraform.json`)
+  and preserves service path prefixes such as `/registry/`.
 - Checks an optional bundled filesystem mirror, then the PVC cache, before
   downloading an archive.
 - Streams archive downloads, verifies the registry SHA-256 checksum, and
   publishes them atomically.
 - Deduplicates concurrent metadata refreshes and archive downloads.
 - Restricts provider origins to `registry.terraform.io` by default and rejects
-  non-HTTPS or non-public archive targets.
+  non-HTTPS or non-public archive targets in direct outbound mode.
 
 The optional module proxy is not part of the production compatibility contract
 and is disabled by default. Enable it explicitly with
@@ -54,15 +60,27 @@ The key flags and environment variables are:
 | `--bind-address` | `SERVER_BIND_ADDRESS` | `0.0.0.0` |
 | `--http-port` | `SERVER_HTTP_PORT` | `8080` |
 | `--https-port` | `SERVER_HTTPS_PORT` | `8443` |
+| `--https-redirect-port` | `SERVER_HTTPS_REDIRECT_PORT` | HTTPS listener port |
 | `--enable-tls` | `SERVER_ENABLE_TLS` | `true` |
 | `--data-source-dir` | `SERVER_DATA_SOURCE_DIR` | `/var/run/open-tf-mirror` |
 | `--allowed-registries` | `SERVER_ALLOWED_REGISTRIES` | `registry.terraform.io` |
+| `--metadata-ttl-seconds` | `SERVER_METADATA_TTL_SECONDS` | `1800` (minimum `30`) |
+| `--outbound-mode` | `SERVER_OUTBOUND_MODE` | `direct` |
+| `--upstream-ca-file` | `SERVER_UPSTREAM_CA_FILE` | unset |
 | `--enable-module-mirror` | `SERVER_ENABLE_MODULE_MIRROR` | `false` |
 
 Custom certificate files are re-read at most once every five seconds. A failed
 reload keeps the last valid matching certificate and private key. With TLS
 enabled, HTTP health probes remain available and other HTTP requests redirect to
-HTTPS.
+HTTPS. The redirect port defaults to the HTTPS listener for direct execution;
+the Helm chart sets it to the Service HTTPS port (443 by default).
+
+`direct` mode ignores proxy environment variables, pins DNS results after
+rejecting private addresses, and revalidates every HTTPS redirect. Set
+`trusted-proxy` only when `HTTP_PROXY`/`HTTPS_PROXY` (or lowercase equivalents)
+are configured; reqwest then applies `NO_PROXY` matching and the proxy controls
+egress isolation. A PEM CA bundle may be supplied with `--upstream-ca-file`;
+malformed bundles fail startup and TLS verification cannot be disabled.
 
 Persistent data uses this layout:
 
@@ -78,7 +96,9 @@ The chart lives at `charts/open-tf-mirror` and can be consumed directly from an
 immutable Git tag. The runtime and provider-copy init container use UID/GID
 `10001`; the server has a read-only root filesystem and writes only to its PVC.
 TLS is disabled by default. Enabling it requires an existing Secret through
-`openTfMirror.tls.secretName`; the chart does not issue ACME certificates.
+`openTfMirror.tls.secretName`; the chart does not issue ACME certificates. An
+optional `openTfMirror.upstreamCA.secretName` mounts the Secret key `ca.crt`
+and configures `--upstream-ca-file` for private registry or archive CAs.
 
 See [the chart README](charts/open-tf-mirror/README.md) for values and rendered
 resource names.

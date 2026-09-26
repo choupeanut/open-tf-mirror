@@ -14,6 +14,8 @@ openTfMirror:
     enabled: true
     domainName: ""
     secretName: open-tf-mirror-tls-secret
+  upstreamCA:
+    secretName: ""
   replicas: 1
   resources: {}
   pvc:
@@ -30,15 +32,18 @@ With `fullnameOverride: open-tf-mirror`, resource names are:
 | Headless Service | `open-tf-mirror-headless` |
 | PVC template | `data` |
 
-The TLS secret from `openTfMirror.tls.secretName` is mounted at `/etc/open-tf-mirror/ssl`, and persistent data is mounted at `/var/run/open-tf-mirror`. Enabling TLS requires a non-empty existing Secret name; the chart does not issue ACME certificates. `domainName` is retained only for compatibility with older values and does not perform certificate issuance.
+The TLS secret from `openTfMirror.tls.secretName` is mounted at `/etc/open-tf-mirror/ssl`, and persistent data is mounted at `/var/run/open-tf-mirror`. Enabling TLS requires a non-empty existing Secret name; the chart does not issue ACME certificates. `domainName` is retained only for compatibility with older values and does not perform certificate issuance. When `openTfMirror.upstreamCA.secretName` is set, its `ca.crt` key is mounted at `/etc/open-tf-mirror/upstream-ca/ca.crt` and trusted for upstream requests.
 
 The server and provider-copy init container run without privilege under UID/GID `10001`. The server root filesystem is read-only; the PVC is its only writable runtime mount. When `openTfMirror.providersMirror.enabled` is true, the init container copies bundled providers into an `emptyDir` that is mounted read-only into the server and exposed through `TF_PLUGIN_MIRROR_DIR`.
 
 `openTfMirror.service.targetPorts.http` and `.https` are the ports on which the
 server listens. The chart adds matching `--http-port` and `--https-port` flags
-unless the corresponding flag is already present in `openTfMirror.args`; an
-explicit flag is retained for compatibility and must match the container port.
-The Service's `ports` values remain the client-facing ports.
+unless the corresponding flag is already present in `openTfMirror.args`. It also
+sets `--https-redirect-port` to the client-facing Service HTTPS port unless an
+explicit flag is present, so the default redirect is to 443 rather than 8443.
+The Service's `ports` values remain the client-facing ports. The pod has a
+30-second termination grace period to allow the server's 15-second connection
+drain to complete.
 
 `global.imagePullSecrets` accepts either secret names or Kubernetes-style
 `{name: ...}` entries. The chart normalizes both forms to
@@ -65,6 +70,7 @@ backward-compatible default of `minAvailable: 1`; numeric zero is preserved.
 | `openTfMirror.tls.enabled` | `false` | Enable TLS using an existing Secret. |
 | `openTfMirror.tls.domainName` | `""` | Legacy compatibility value; certificate issuance is not implemented. |
 | `openTfMirror.tls.secretName` | `""` | Existing TLS secret to mount. |
+| `openTfMirror.upstreamCA.secretName` | `""` | Optional Secret containing `ca.crt` for upstream TLS. |
 | `openTfMirror.resources` | `{}` | Container requests and limits. |
 | `openTfMirror.pvc.size` | `1Gi` | PVC template size. |
 | `openTfMirror.pvc.storageClass` | `""` | PVC storage class. |

@@ -11,12 +11,22 @@ Create an ApplicationSet entry that sources the immutable release tag from
 `charts/open-tf-mirror`. Keep the existing cluster generator and namespace
 ownership model. Pin `targetRevision` to a release tag rather than `main`.
 
+For this reliability revision, use chart/image `0.2.1`. The chart keeps the
+existing client-facing HTTPS Service port at 443 while passing the Service port
+to `--https-redirect-port`; do not hard-code the container port 8443 in the
+redirect setting. Preserve existing `env`/`envFrom` entries for proxy settings.
+
 Set the image tag to the same release version as the chart `appVersion`. Keep
 the existing PVC size and storage class for the target cluster. For TLS, apply a
 cert-manager `Certificate` in the same namespace, with `spec.secretName` equal
 to `openTfMirror.tls.secretName`, and set `openTfMirror.tls.enabled: true`.
 The Secret volume is mounted at `/etc/open-tf-mirror/ssl`; the application
 reloads a valid renewed certificate without a pod restart.
+If the upstream registry uses a private CA, create a Secret with key `ca.crt`
+and set `openTfMirror.upstreamCA.secretName`; the chart mounts it read-only and
+configures the startup-validated CA bundle path. Use `openTfMirror.args` or
+`env`/`envFrom` for `trusted-proxy` and proxy variables; there is intentionally
+no second proxy-specific values interface.
 
 The chart requires Kubernetes 1.21 or newer. Before syncing, render the exact
 ApplicationSet values with Helm and check that the Service, headless Service,
