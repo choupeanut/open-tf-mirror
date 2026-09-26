@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -11,15 +10,18 @@ use std::{
 
 use futures_util::StreamExt;
 use parking_lot::RwLock;
-use reqwest::{Client, StatusCode, Url, header};
+use reqwest::Url;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::lookup_host,
     sync::{Mutex, Semaphore},
 };
 
-use crate::{metadata::PlatformMetadata, provider::ArchiveName};
+use crate::{
+    metadata::PlatformMetadata,
+    outbound::{OutboundClient, OutboundError},
+    provider::ArchiveName,
+};
 
 const MAX_PROVIDER_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONCURRENT_DOWNLOADS: usize = 8;
@@ -49,6 +51,8 @@ pub enum ProviderStorageError {
     Redirect(String),
     #[error("provider download failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("provider outbound policy failed: {0}")]
+    Outbound(#[from] OutboundError),
     #[error("provider cache I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -59,28 +63,8 @@ pub struct ProviderStorage {
     bundled_mirror: Option<Arc<PathBuf>>,
     locks: Arc<RwLock<HashMap<ProviderArchiveKey, Arc<Mutex<()>>>>>,
     max_archive_bytes: u64,
-    download_policy: DownloadPolicy,
+    outbound: OutboundClient,
     download_limit: Arc<Semaphore>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DownloadPolicy {
-    allow_http: bool,
-    allow_non_public_ips: bool,
-    max_redirects: usize,
-}
-
-impl DownloadPolicy {
-    const PRODUCTION: Self = Self {
-        allow_http: false,
-        allow_non_public_ips: false,
-        max_redirects: 5,
-    };
-    const TEST: Self = Self {
-        allow_http: true,
-        allow_non_public_ips: true,
-        max_redirects: 5,
-    };
 }
 
 impl ProviderStorage {
@@ -90,7 +74,8 @@ impl ProviderStorage {
             root.as_ref(),
             bundled.as_deref(),
             MAX_PROVIDER_ARCHIVE_BYTES,
-            DownloadPolicy::PRODUCTION,
+            OutboundClient::new(crate::outbound::OutboundMode::Direct, None)
+                .expect("provider download client configuration must be valid"),
         )
         .expect("provider download client configuration must be valid")
     }
@@ -103,7 +88,21 @@ impl ProviderStorage {
             root.as_ref(),
             bundled_mirror.as_ref().map(|path| path.as_ref()),
             MAX_PROVIDER_ARCHIVE_BYTES,
-            DownloadPolicy::PRODUCTION,
+            OutboundClient::new(crate::outbound::OutboundMode::Direct, None)
+                .map_err(|error| ProviderStorageError::InvalidKey(error.to_string()))?,
+        )
+    }
+
+    pub fn with_bundled_mirror_and_outbound(
+        root: impl AsRef<Path>,
+        bundled_mirror: Option<impl AsRef<Path>>,
+        outbound: OutboundClient,
+    ) -> Result<Self, ProviderStorageError> {
+        Self::build(
+            root.as_ref(),
+            bundled_mirror.as_ref().map(|path| path.as_ref()),
+            MAX_PROVIDER_ARCHIVE_BYTES,
+            outbound,
         )
     }
 
@@ -116,7 +115,7 @@ impl ProviderStorage {
             root.as_ref(),
             bundled_mirror.as_ref().map(|path| path.as_ref()),
             max_archive_bytes,
-            DownloadPolicy::TEST,
+            OutboundClient::for_tests(),
         )
     }
 
@@ -124,7 +123,7 @@ impl ProviderStorage {
         root: &Path,
         bundled_mirror: Option<&Path>,
         max_archive_bytes: u64,
-        download_policy: DownloadPolicy,
+        outbound: OutboundClient,
     ) -> Result<Self, ProviderStorageError> {
         Ok(Self {
             root: Arc::new(root.to_path_buf()),
@@ -132,7 +131,7 @@ impl ProviderStorage {
             locks: Arc::default(),
             // The PVC capacity is the aggregate persistent-cache quota; this is only a per-archive guard.
             max_archive_bytes,
-            download_policy,
+            outbound,
             download_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
         })
     }
@@ -290,7 +289,11 @@ impl ProviderStorage {
         options.create_new(true).write(true);
         let mut file = options.open(&temp_path).await?;
 
-        let response = self.send_with_policy(url).await?;
+        let response = self
+            .outbound
+            .get(url, Duration::from_secs(15 * 60))
+            .await?
+            .error_for_status()?;
         if response
             .content_length()
             .is_some_and(|length| length > self.max_archive_bytes)
@@ -322,74 +325,6 @@ impl ProviderStorage {
         cleanup.disarm();
         sync_parent(parent).await?;
         Ok(())
-    }
-
-    async fn send_with_policy(
-        &self,
-        mut url: Url,
-    ) -> Result<reqwest::Response, ProviderStorageError> {
-        for redirect_count in 0..=self.download_policy.max_redirects {
-            let client = self.client_for_url(&url).await?;
-            let response = client.get(url.clone()).send().await?;
-            if !is_redirect(response.status()) {
-                return Ok(response.error_for_status()?);
-            }
-            if redirect_count == self.download_policy.max_redirects {
-                return Err(ProviderStorageError::Redirect(
-                    "maximum redirect count exceeded".into(),
-                ));
-            }
-            let location = response
-                .headers()
-                .get(header::LOCATION)
-                .ok_or_else(|| ProviderStorageError::Redirect("missing Location header".into()))?
-                .to_str()
-                .map_err(|_| ProviderStorageError::Redirect("invalid Location header".into()))?;
-            url = url
-                .join(location)
-                .map_err(|_| ProviderStorageError::Redirect("invalid Location URL".into()))?;
-        }
-        unreachable!("bounded redirect loop returns")
-    }
-
-    async fn client_for_url(&self, url: &Url) -> Result<Client, ProviderStorageError> {
-        if url.scheme() != "https" && !(self.download_policy.allow_http && url.scheme() == "http") {
-            return Err(ProviderStorageError::Policy("HTTPS is required".into()));
-        }
-        let host = url
-            .host_str()
-            .ok_or_else(|| ProviderStorageError::Policy("URL host is required".into()))?;
-        let resolver_host = host
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-            .unwrap_or(host);
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| ProviderStorageError::Policy("URL port is required".into()))?;
-        let addresses = lookup_host((resolver_host, port))
-            .await?
-            .collect::<Vec<SocketAddr>>();
-        if addresses.is_empty() {
-            return Err(ProviderStorageError::Policy(
-                "URL host did not resolve".into(),
-            ));
-        }
-        if !self.download_policy.allow_non_public_ips
-            && addresses.iter().any(|address| !is_public_ip(address.ip()))
-        {
-            return Err(ProviderStorageError::Policy(
-                "URL resolves to a non-public address".into(),
-            ));
-        }
-        Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(15 * 60))
-            .redirect(reqwest::redirect::Policy::none())
-            // Pin the addresses that passed policy so DNS cannot change before connect.
-            .resolve_to_addrs(resolver_host, &addresses)
-            .build()
-            .map_err(Into::into)
     }
 }
 
@@ -471,52 +406,6 @@ fn valid_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
-fn is_redirect(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    )
-}
-
-fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [first, second, third, _] = ip.octets();
-            !ip.is_private()
-                && !ip.is_loopback()
-                && !ip.is_link_local()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && first != 0
-                && first < 224
-                && !(first == 100 && (64..=127).contains(&second))
-                && !(first == 192 && second == 0)
-                && !(first == 192 && second == 88 && third == 99)
-                && !(first == 192 && second == 0 && third == 2)
-                && !(first == 198 && matches!(second, 18 | 19))
-                && !(first == 198 && second == 51 && third == 100)
-                && !(first == 203 && second == 0 && third == 113)
-        }
-        IpAddr::V6(ip) => {
-            if let Some(ipv4) = ip.to_ipv4() {
-                return is_public_ip(IpAddr::V4(ipv4));
-            }
-            let segments = ip.segments();
-            !ip.is_loopback()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && !ip.is_unique_local()
-                && !ip.is_unicast_link_local()
-                && (segments[0] & 0xffc0) != 0xfec0
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
-        }
-    }
 }
 
 #[cfg(unix)]
