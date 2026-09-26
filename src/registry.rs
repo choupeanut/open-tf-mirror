@@ -34,6 +34,8 @@ pub enum RegistryError {
     InvalidResponse(String),
     #[error("registry response exceeds {0} bytes")]
     ResponseTooLarge(usize),
+    #[error("registry discovery is in retry backoff")]
+    DiscoveryBackoff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -64,7 +66,7 @@ pub struct RegistryClient {
 
 #[derive(Debug, Clone)]
 struct DiscoveryEntry {
-    origin: Url,
+    origin: Option<Url>,
     fetched_at: Instant,
     retry_at: Option<Instant>,
 }
@@ -86,9 +88,12 @@ impl RegistryClient {
         })
     }
 
+    /// Use a test server's conventional provider API without service discovery.
     pub fn with_origin(hostname: &str, origin: String) -> Result<Self, RegistryError> {
         let mut registry = Self::with_outbound(OutboundClient::for_tests());
-        let url = parse_origin(&origin)?;
+        let url = parse_origin(&origin)?
+            .join("v1/providers/")
+            .map_err(|error| RegistryError::InvalidOrigin(error.to_string()))?;
         registry.origins.insert(hostname.to_string(), url);
         Ok(registry)
     }
@@ -131,9 +136,7 @@ impl RegistryClient {
         let url = self
             .origin(hostname)
             .await?
-            .join(&format!(
-                "v1/providers/{namespace}/{provider_type}/versions"
-            ))
+            .join(&format!("{namespace}/{provider_type}/versions"))
             .map_err(|error| RegistryError::InvalidOrigin(error.to_string()))?;
         let response = self.outbound.get(url, Duration::from_secs(30)).await?;
         if response.status() == StatusCode::NOT_FOUND {
@@ -170,7 +173,7 @@ impl RegistryClient {
             .origin(hostname)
             .await?
             .join(&format!(
-                "v1/providers/{namespace}/{provider_type}/{version}/download/{}/{}",
+                "{namespace}/{provider_type}/{version}/download/{}/{}",
                 platform.os, platform.arch
             ))
             .map_err(|error| RegistryError::InvalidOrigin(error.to_string()))?;
@@ -184,12 +187,12 @@ impl RegistryClient {
     async fn discover(&self, hostname: &str, base: Url) -> Result<Url, RegistryError> {
         if let Some(entry) = self.discovery_cache.read().get(hostname).cloned() {
             let age = entry.fetched_at.elapsed();
-            if age < Duration::from_secs(30 * 60)
+            if (entry.origin.is_some() && age < Duration::from_secs(30 * 60))
                 || entry
                     .retry_at
                     .is_some_and(|retry_at| Instant::now() < retry_at)
             {
-                return Ok(entry.origin);
+                return entry.origin.ok_or(RegistryError::DiscoveryBackoff);
             }
         }
         let lock = self
@@ -201,12 +204,12 @@ impl RegistryClient {
         let _guard = lock.lock().await;
         if let Some(entry) = self.discovery_cache.read().get(hostname).cloned() {
             let age = entry.fetched_at.elapsed();
-            if age < Duration::from_secs(30 * 60)
+            if (entry.origin.is_some() && age < Duration::from_secs(30 * 60))
                 || entry
                     .retry_at
                     .is_some_and(|retry_at| Instant::now() < retry_at)
             {
-                return Ok(entry.origin);
+                return entry.origin.ok_or(RegistryError::DiscoveryBackoff);
             }
         }
         let discovery_url = base
@@ -217,6 +220,7 @@ impl RegistryClient {
                 .outbound
                 .get(discovery_url, Duration::from_secs(30))
                 .await?;
+            let final_discovery_url = response.url().clone();
             let document =
                 decode_json::<DiscoveryResponse>(response.error_for_status()?, 64 * 1024).await?;
             let service = document.providers_v1.ok_or_else(|| {
@@ -224,7 +228,7 @@ impl RegistryClient {
                     "Terraform discovery document is missing providers.v1".into(),
                 )
             })?;
-            let origin = base
+            let origin = final_discovery_url
                 .join(&service)
                 .map_err(|error| RegistryError::InvalidOrigin(error.to_string()))?;
             if origin.host_str().is_none()
@@ -242,25 +246,22 @@ impl RegistryClient {
                 self.discovery_cache.write().insert(
                     hostname.to_string(),
                     DiscoveryEntry {
-                        origin,
+                        origin: Some(origin.clone()),
                         fetched_at: Instant::now(),
                         retry_at: None,
                     },
                 );
-                Ok(self
-                    .discovery_cache
-                    .read()
-                    .get(hostname)
-                    .expect("discovery cache entry inserted")
-                    .origin
-                    .clone())
+                Ok(origin)
             }
             Err(error) => {
-                if let Some(entry) = self.discovery_cache.write().get_mut(hostname) {
-                    entry.retry_at = Some(Instant::now() + Duration::from_secs(30));
-                    return Ok(entry.origin.clone());
-                }
-                Err(error)
+                let mut cache = self.discovery_cache.write();
+                let entry = cache.entry(hostname.to_string()).or_insert(DiscoveryEntry {
+                    origin: None,
+                    fetched_at: Instant::now(),
+                    retry_at: None,
+                });
+                entry.retry_at = Some(Instant::now() + Duration::from_secs(30));
+                entry.origin.clone().ok_or(error)
             }
         }
     }
@@ -315,6 +316,52 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn cold_discovery_retries_after_backoff_expires() {
+        let server = MockServer::start().await;
+        Mock::given(path("/.well-known/terraform.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry =
+            RegistryClient::with_discovery_origin("registry.example", server.uri()).unwrap();
+        let base = reqwest::Url::parse(&server.uri()).unwrap();
+        assert!(
+            registry
+                .discover("registry.example", base.clone())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            registry.discover("registry.example", base.clone()).await,
+            Err(super::RegistryError::DiscoveryBackoff)
+        ));
+        server.verify().await;
+        server.reset().await;
+        registry
+            .discovery_cache
+            .write()
+            .get_mut("registry.example")
+            .unwrap()
+            .retry_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        Mock::given(path("/.well-known/terraform.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"providers.v1": "/registry/"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            registry
+                .discover("registry.example", base)
+                .await
+                .unwrap()
+                .path(),
+            "/registry/"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_discovery_origin_is_used_during_retry_backoff() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -325,7 +372,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/registry/v1/providers/hashicorp/random/versions"))
+            .and(path("/registry/hashicorp/random/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "versions": [] })))
             .mount(&server)
             .await;
@@ -346,20 +393,23 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/.well-known/terraform.json"))
             .respond_with(ResponseTemplate::new(503))
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/registry/v1/providers/hashicorp/random/versions"))
+            .and(path("/registry/hashicorp/random/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "versions": [] })))
             .mount(&server)
             .await;
 
-        assert!(
-            registry
-                .versions("registry.example", "hashicorp", "random")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        for _ in 0..2 {
+            assert!(
+                registry
+                    .versions("registry.example", "hashicorp", "random")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

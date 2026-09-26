@@ -33,6 +33,36 @@ implemented; this release keeps HTTPS and certificate validation mandatory.
 
 ## Verification Gate
 
+### Follow-up discovery corrections
+
+The pre-release review found three discovery defects, now covered by regression
+tests before publication:
+
+- The discovered `providers.v1` URL is the complete API base. Version and package
+  requests append only their protocol-relative endpoint, without an additional
+  `v1/providers/` prefix. The fixtures now use the actual protocol paths.
+- Relative service URLs resolve against the final discovery response URL after
+  redirects, not the original hostname root.
+- Cold discovery failures share the same 30-second hostname retry window as
+  stale failures. An entry can have no last-good URL; after the retry deadline it
+  can recover normally. The existing cache and lock are reused.
+
+The corrected discovery integration tests failed against the previous code
+(five failures, including duplicate cold requests) before the implementation
+was changed. Coverage also includes package lookup and deterministic retry
+expiry without sleeping for 30 seconds.
+
+Local release verification passed with `RUN_E2E=1 ./scripts/verify.sh`: formatting,
+Clippy, 81 tests, dependency audit, Helm lint/render, Docker build using Rust
+1.88, and Terraform online installation followed by a restarted mirror on an
+internal Docker network. Removing the cached archive then correctly failed
+installation without leaving a temporary archive. The three independent review
+probes also pass. Consumer repositories and deployments were not changed.
+
+This evidence does not cover proxy-only/NO_PROXY and custom-CA handshake fixtures
+or HTTP/2 GOAWAY and slow in-flight transfer shutdown tests; those remain test
+coverage gaps rather than verified compatibility claims.
+
 Before publishing `v0.2.1`, run `./scripts/verify.sh` (or the equivalent CI
 steps) for formatting, Clippy, all deterministic tests, RustSec audit, Helm
 render/lint, and Docker build. Run `RUN_E2E=1 ./scripts/verify.sh` for the
