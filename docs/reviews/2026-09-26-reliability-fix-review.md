@@ -22,10 +22,12 @@ migration runbooks.
 
 The implementation retains the Terraform provider network-mirror URL shape and
 PVC archive layout used by the existing consumers. It also addresses the
-upstream HermitCrab themes tracked in PR #28 and issues #14, #15, #22, #24,
-#26, and #27 without importing HermitCrab's implementation: certificate
-reload remains atomic, proxy/CA policy is explicit, Teleport discovery keeps
-`/registry/`, and archive responses are streamed with checksum verification.
+upstream HermitCrab themes tracked in PR #28 and the current open issues #26
+and #27 without importing HermitCrab's implementation: certificate reload
+remains atomic, missing-version refresh handles the provider sync gap, direct
+full-body downloads accept a normal `200 OK`, proxy/CA policy is explicit,
+Teleport discovery keeps `/registry/`, and archive responses are streamed with
+checksum verification.
 Issue #22's request for disabling TLS verification is intentionally not
 implemented; this release keeps HTTPS and certificate validation mandatory.
 
