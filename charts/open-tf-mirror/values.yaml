@@ -15,7 +15,7 @@ openTfMirror:
 
   image:
     repository: peanutchou/open-tf-mirror
-    tag: 0.2.0
+    tag: 0.2.1
     pullPolicy: IfNotPresent
 
   podSecurityContext:
@@ -93,6 +93,9 @@ openTfMirror:
   tls:
     enabled: false
     domainName: ""
+    secretName: ""
+
+  upstreamCA:
     secretName: ""
 
   providersMirror:

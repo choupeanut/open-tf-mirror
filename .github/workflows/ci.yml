@@ -144,6 +144,8 @@ jobs:
           grep -q "image: ${image_repository}:${image_tag}$" /tmp/open-tf-mirror-default.yaml
           grep -q -- '--http-port=8080$' /tmp/open-tf-mirror-default.yaml
           grep -q -- '--https-port=8443$' /tmp/open-tf-mirror-default.yaml
+          grep -q -- '--https-redirect-port=443$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'terminationGracePeriodSeconds: 30$' /tmp/open-tf-mirror-default.yaml
           grep -q '^      initContainers:$' /tmp/open-tf-mirror-default.yaml
           grep -q 'runAsUser: 10001$' /tmp/open-tf-mirror-default.yaml
           grep -q 'runAsGroup: 10001$' /tmp/open-tf-mirror-default.yaml
@@ -253,6 +255,13 @@ jobs:
           grep -q 'containerPort: 8443$' /tmp/open-tf-mirror-rendered.yaml
           grep -q -- '--tls-private-key-file=/etc/open-tf-mirror/ssl/tls.key' /tmp/open-tf-mirror-rendered.yaml
           ! grep -q -- '--tls-auto-cert-domains' /tmp/open-tf-mirror-rendered.yaml
+
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.upstreamCA.secretName=open-tf-mirror-upstream-ca \
+            >/tmp/open-tf-mirror-upstream-ca.yaml
+          grep -q -- '--upstream-ca-file=/etc/open-tf-mirror/upstream-ca/ca.crt' /tmp/open-tf-mirror-upstream-ca.yaml
+          grep -q 'secretName: open-tf-mirror-upstream-ca$' /tmp/open-tf-mirror-upstream-ca.yaml
+          grep -q 'key: ca.crt$' /tmp/open-tf-mirror-upstream-ca.yaml
 
       - name: Package chart
         run: |

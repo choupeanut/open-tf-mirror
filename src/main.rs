@@ -24,6 +24,8 @@ use open_tf_mirror::{
     http_api::{AppState, RouterOptions, build_router_with_options},
     metadata::ProviderMetadataStore,
     module_mirror::ModuleCache,
+    outbound::{OutboundClient, OutboundMode},
+    registry::RegistryClient,
     storage::ProviderStorage,
     tls_reload::ReloadingCertResolver,
 };
@@ -61,6 +63,9 @@ struct Args {
     #[arg(long, env = "SERVER_HTTPS_PORT", default_value_t = 8443)]
     https_port: u16,
 
+    #[arg(long, env = "SERVER_HTTPS_REDIRECT_PORT")]
+    https_redirect_port: Option<u16>,
+
     #[arg(long, env = "SERVER_ENABLE_TLS", default_value_t = true, action = ArgAction::Set)]
     enable_tls: bool,
 
@@ -95,6 +100,19 @@ struct Args {
     )]
     allowed_registries: Vec<String>,
 
+    #[arg(
+        long,
+        env = "SERVER_METADATA_TTL_SECONDS",
+        default_value_t = 30 * 60
+    )]
+    metadata_ttl_seconds: u64,
+
+    #[arg(long, env = "SERVER_OUTBOUND_MODE", default_value = "direct")]
+    outbound_mode: OutboundMode,
+
+    #[arg(long, env = "SERVER_UPSTREAM_CA_FILE")]
+    upstream_ca_file: Option<PathBuf>,
+
     #[arg(long, env = "SERVER_ENABLE_MODULE_MIRROR", default_value_t = false, action = ArgAction::Set)]
     enable_module_mirror: bool,
 
@@ -116,18 +134,29 @@ async fn main() -> Result<()> {
     install_crypto_provider()?;
     let args = Args::parse();
     init_tracing(args.log_debug, args.log_verbosity);
+    if args.metadata_ttl_seconds < 30 {
+        anyhow::bail!("--metadata-ttl-seconds must be at least 30");
+    }
+    let outbound = OutboundClient::new(args.outbound_mode, args.upstream_ca_file.as_deref())
+        .context("configure upstream outbound client")?;
     prepare_data_dir(&args.data_source_dir).await?;
+    let bundled_mirror = std::env::var_os("TF_PLUGIN_MIRROR_DIR").map(PathBuf::from);
 
     let state = AppState {
-        metadata: ProviderMetadataStore::new(
+        metadata: ProviderMetadataStore::with_registry_client(
             &args.data_source_dir,
             args.allowed_registries
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>(),
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(args.metadata_ttl_seconds),
+            RegistryClient::with_outbound(outbound.clone()),
         )?,
-        provider_storage: ProviderStorage::new(&args.data_source_dir),
+        provider_storage: ProviderStorage::with_bundled_mirror_and_outbound(
+            &args.data_source_dir,
+            bundled_mirror.as_deref(),
+            outbound,
+        )?,
         module_cache: ModuleCache::new(&args.data_source_dir),
         module_registry_base: args.module_registry_base,
         data_dir: Arc::new(args.data_source_dir.clone()),
@@ -168,7 +197,7 @@ async fn main() -> Result<()> {
             .context("--tls-private-key-file is required when TLS is enabled")?;
         let https_addr = bind_addr(&args.bind_address, args.https_port, "HTTPS")?;
         let http_app = app.clone().layer(middleware::from_fn_with_state(
-            args.https_port,
+            args.https_redirect_port.unwrap_or(args.https_port),
             redirect_http_to_https,
         ));
         let http = serve_http(http_addr, http_app, shutdown_rx.clone());
@@ -243,12 +272,23 @@ async fn serve_http(
         .await
         .with_context(|| format!("bind HTTP listener on {addr}"))?;
     tracing::info!(%addr, "serving HTTP");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
-        })
-        .await
-        .context("serve HTTP listener")
+    let mut shutdown_signal = shutdown.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+    });
+    let mut server = Box::pin(server.into_future());
+    tokio::select! {
+        result = &mut server => result.context("serve HTTP listener"),
+        _ = shutdown_requested(&mut shutdown_signal) => {
+            match tokio::time::timeout(HTTPS_SHUTDOWN_GRACE_PERIOD, &mut server).await {
+                Ok(result) => result.context("serve HTTP listener"),
+                Err(_) => {
+                    tracing::warn!("HTTP shutdown grace period exceeded; cancelling remaining connections");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 async fn serve_https(
@@ -280,6 +320,24 @@ async fn serve_https_with_timeouts(
     key_path: PathBuf,
     app: Router,
     conn_burst: usize,
+    shutdown: watch::Receiver<bool>,
+    options: HttpsServeOptions,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind HTTPS listener on {addr}"))?;
+    serve_https_with_listener(
+        listener, cert_path, key_path, app, conn_burst, shutdown, options,
+    )
+    .await
+}
+
+async fn serve_https_with_listener(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    app: Router,
+    conn_burst: usize,
     mut shutdown: watch::Receiver<bool>,
     options: HttpsServeOptions,
 ) -> Result<()> {
@@ -289,10 +347,7 @@ async fn serve_https_with_timeouts(
         .with_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind HTTPS listener on {addr}"))?;
-    tracing::info!(%addr, "serving HTTPS");
+    tracing::info!(addr = ?listener.local_addr()?, "serving HTTPS");
     let semaphore = Arc::new(Semaphore::new(conn_burst.max(1)));
     let mut connections = JoinSet::new();
 
@@ -326,7 +381,7 @@ async fn serve_https_with_timeouts(
             let Some(stream) = accept_tls_with_timeout(
                 &acceptor,
                 stream,
-                connection_shutdown,
+                connection_shutdown.clone(),
                 options.handshake_timeout,
             )
             .await
@@ -346,8 +401,20 @@ async fn serve_https_with_timeouts(
                 .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
                 .keep_alive_timeout(HTTP_IDLE_TIMEOUT)
                 .timer(TokioTimer::new());
-            if let Err(err) = builder.serve_connection(io, service).await {
-                tracing::debug!(%peer_addr, error = %err, "HTTPS connection failed");
+            let mut connection = Box::pin(builder.serve_connection(io, service));
+            let mut connection_shutdown = connection_shutdown;
+            tokio::select! {
+                result = &mut connection => {
+                    if let Err(err) = result {
+                        tracing::debug!(%peer_addr, error = %err, "HTTPS connection failed");
+                    }
+                }
+                _ = shutdown_requested(&mut connection_shutdown) => {
+                    connection.as_mut().graceful_shutdown();
+                    if let Err(err) = connection.await {
+                        tracing::debug!(%peer_addr, error = %err, "HTTPS connection failed during graceful shutdown");
+                    }
+                }
             }
         });
         while connections.try_join_next().is_some() {}
@@ -452,15 +519,21 @@ async fn wait_for_shutdown_signal(shutdown: watch::Sender<bool>) {
 mod tests {
     use std::{fs, path::Path, sync::Arc};
 
+    use axum::{Router, routing::get};
     use clap::Parser;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
-    use rustls::ServerConfig;
-    use tokio::{net::TcpListener, sync::watch, time::timeout};
-    use tokio_rustls::TlsAcceptor;
+    use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::watch,
+        time::{sleep, timeout},
+    };
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     use super::{
-        Args, ReloadingCertResolver, accept_tls_with_timeout, bind_addr, install_crypto_provider,
-        redirect_location,
+        Args, HttpsServeOptions, OutboundMode, ReloadingCertResolver, accept_tls_with_timeout,
+        bind_addr, install_crypto_provider, redirect_location, serve_https_with_listener,
     };
 
     fn test_tls_acceptor(dir: &Path) -> TlsAcceptor {
@@ -479,6 +552,21 @@ mod tests {
         fs::write(dir.path().join("tls.crt"), cert.pem()).unwrap();
         fs::write(dir.path().join("tls.key"), signing_key.serialize_pem()).unwrap();
         dir
+    }
+
+    fn write_test_tls_pair_with_certificate() -> (
+        tempfile::TempDir,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        fs::write(dir.path().join("tls.crt"), cert.pem()).unwrap();
+        fs::write(dir.path().join("tls.key"), signing_key.serialize_pem()).unwrap();
+        (
+            dir,
+            rustls::pki_types::CertificateDer::from(cert.der().to_vec()),
+        )
     }
 
     #[test]
@@ -508,7 +596,25 @@ mod tests {
         let args = Args::parse_from(["open-tf-mirror", "--enable-tls=false"]);
 
         assert_eq!(args.allowed_registries, vec!["registry.terraform.io"]);
+        assert_eq!(args.metadata_ttl_seconds, 1800);
+        assert_eq!(args.outbound_mode, OutboundMode::Direct);
+        assert_eq!(args.https_redirect_port, None);
         assert!(!args.enable_module_mirror);
+    }
+
+    #[test]
+    fn cli_accepts_outbound_and_redirect_overrides() {
+        let args = Args::parse_from([
+            "open-tf-mirror",
+            "--enable-tls=false",
+            "--metadata-ttl-seconds=60",
+            "--outbound-mode=trusted-proxy",
+            "--https-redirect-port=443",
+        ]);
+
+        assert_eq!(args.metadata_ttl_seconds, 60);
+        assert_eq!(args.outbound_mode, OutboundMode::TrustedProxy);
+        assert_eq!(args.https_redirect_port, Some(443));
     }
 
     #[test]
@@ -589,5 +695,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn https_shutdown_drains_and_closes_keepalive_connections() {
+        install_crypto_provider().unwrap();
+        let (dir, certificate) = write_test_tls_pair_with_certificate();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(serve_https_with_listener(
+            listener,
+            dir.path().join("tls.crt"),
+            dir.path().join("tls.key"),
+            app,
+            8,
+            shutdown_rx,
+            HttpsServeOptions {
+                handshake_timeout: std::time::Duration::from_secs(1),
+                shutdown_grace_period: std::time::Duration::from_secs(1),
+            },
+        ));
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut stream = connector.connect(server_name, tcp).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            response.extend_from_slice(&buffer[..read]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        shutdown_tx.send(true).unwrap();
+        sleep(std::time::Duration::from_millis(50)).await;
+        let second_request = stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        if second_request.is_ok() {
+            let read = timeout(std::time::Duration::from_secs(1), stream.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read, 0, "shutdown accepted a new keep-alive request");
+        }
+        timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

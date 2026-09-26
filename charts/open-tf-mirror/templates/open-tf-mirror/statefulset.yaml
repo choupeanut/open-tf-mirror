@@ -25,6 +25,7 @@ spec:
         {{- include "open-tf-mirror.labels" . | nindent 8 }}
         app.kubernetes.io/version: {{ include "open-tf-mirror.parseImageTag" (dict "image" .Values.openTfMirror.image) | trunc 63 | quote }}
     spec:
+      terminationGracePeriodSeconds: 30
       automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.openTfMirror.podSecurityContext | nindent 8 }}
@@ -71,6 +72,10 @@ spec:
           {{- $args = append $args (printf "--https-port=%d" (int .Values.openTfMirror.service.targetPorts.https)) }}
           {{- end }}
           {{- $argsText = join " " $args }}
+          {{- if not (contains "--https-redirect-port" $argsText) }}
+          {{- $args = append $args (printf "--https-redirect-port=%d" (int .Values.openTfMirror.service.ports.https)) }}
+          {{- end }}
+          {{- $argsText = join " " $args }}
           {{- if not .Values.openTfMirror.tls.enabled }}
           {{- if not (contains "--enable-tls" $argsText) }}
           {{- $args = append $args "--enable-tls=false" }}
@@ -84,6 +89,10 @@ spec:
           {{- end }}
           {{- else if .Values.openTfMirror.tls.domainName }}
           {{- $args = append $args (printf "--tls-auto-cert-domains=%s" .Values.openTfMirror.tls.domainName) }}
+          {{- end }}
+          {{- $argsText = join " " $args }}
+          {{- if and .Values.openTfMirror.upstreamCA.secretName (not (contains "--upstream-ca-file" $argsText)) }}
+          {{- $args = append $args "--upstream-ca-file=/etc/open-tf-mirror/upstream-ca/ca.crt" }}
           {{- end }}
           {{- if $args }}
           args:
@@ -157,6 +166,11 @@ spec:
               mountPath: /etc/open-tf-mirror/ssl
               readOnly: true
             {{- end }}
+            {{- if .Values.openTfMirror.upstreamCA.secretName }}
+            - name: upstream-ca
+              mountPath: /etc/open-tf-mirror/upstream-ca
+              readOnly: true
+            {{- end }}
             {{- if .Values.openTfMirror.providersMirror.enabled }}
             - name: providers-mirror
               mountPath: /usr/share/terraform/providers/plugins
@@ -171,6 +185,14 @@ spec:
         - name: custom-tls
           secret:
             secretName: {{ .Values.openTfMirror.tls.secretName }}
+        {{- end }}
+        {{- if .Values.openTfMirror.upstreamCA.secretName }}
+        - name: upstream-ca
+          secret:
+            secretName: {{ .Values.openTfMirror.upstreamCA.secretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
         {{- end }}
         {{- if .Values.openTfMirror.providersMirror.enabled }}
         - name: providers-mirror

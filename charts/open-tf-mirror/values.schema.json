@@ -58,6 +58,7 @@
         "service",
         "pvc",
         "tls",
+        "upstreamCA",
         "providersMirror"
       ],
       "properties": {
@@ -146,6 +147,14 @@
               }
             }
           ]
+        },
+        "upstreamCA": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["secretName"],
+          "properties": {
+            "secretName": { "type": "string" }
+          }
         },
         "providersMirror": {
           "type": "object",
