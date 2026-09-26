@@ -304,3 +304,62 @@ async fn decode_json<T: DeserializeOwned>(
     }
     serde_json::from_slice(&body).map_err(|error| RegistryError::InvalidResponse(error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RegistryClient;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[tokio::test]
+    async fn stale_discovery_origin_is_used_during_retry_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/terraform.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "providers.v1": "/registry/"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/registry/v1/providers/hashicorp/random/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "versions": [] })))
+            .mount(&server)
+            .await;
+        let registry =
+            RegistryClient::with_discovery_origin("registry.example", server.uri()).unwrap();
+        registry
+            .versions("registry.example", "hashicorp", "random")
+            .await
+            .unwrap();
+        registry
+            .discovery_cache
+            .write()
+            .get_mut("registry.example")
+            .unwrap()
+            .fetched_at = std::time::Instant::now() - std::time::Duration::from_secs(31 * 60);
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/terraform.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/registry/v1/providers/hashicorp/random/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "versions": [] })))
+            .mount(&server)
+            .await;
+
+        assert!(
+            registry
+                .versions("registry.example", "hashicorp", "random")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
