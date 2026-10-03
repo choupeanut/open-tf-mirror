@@ -348,3 +348,32 @@ async fn traversal_components_are_rejected() {
 
     assert!(error.to_string().contains("invalid"));
 }
+
+#[test]
+fn stale_temp_files_are_removed_at_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider_dir = temp
+        .path()
+        .join("providers/registry.terraform.io/hashicorp/random");
+    let metadata_dir = temp
+        .path()
+        .join("metadata/registry.terraform.io/hashicorp/random");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    std::fs::create_dir_all(&metadata_dir).unwrap();
+    let archive = provider_dir.join("terraform-provider-random_3.6.2_linux_amd64.zip");
+    std::fs::write(&archive, b"zip").unwrap();
+    std::fs::write(
+        provider_dir.join(".terraform-provider-random_3.6.2_linux_amd64.zip-7-0.tmp"),
+        b"partial",
+    )
+    .unwrap();
+    std::fs::write(metadata_dir.join(".metadata-7-1.tmp"), b"partial").unwrap();
+    std::fs::write(metadata_dir.join("index.json"), b"{}").unwrap();
+
+    let removed = open_tf_mirror::storage::remove_stale_temp_files(temp.path()).unwrap();
+
+    assert_eq!(removed, 2);
+    assert!(archive.exists());
+    assert!(metadata_dir.join("index.json").exists());
+    assert_eq!(std::fs::read_dir(&provider_dir).unwrap().count(), 1);
+}

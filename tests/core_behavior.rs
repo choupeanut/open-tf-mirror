@@ -1,13 +1,6 @@
-use std::fs;
-
 use open_tf_mirror::{
-    module_mirror::{ModuleCache, ModuleId},
     provider::ArchiveName,
     storage::{ProviderArchiveKey, ProviderStorage},
-};
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
 };
 
 #[test]
@@ -79,85 +72,5 @@ async fn provider_storage_uses_terraform_mirror_compatible_layout() {
         path,
         tmp.path()
             .join("providers/registry.terraform.io/hashicorp/random/terraform-provider-random_3.6.2_linux_amd64.zip")
-    );
-}
-
-#[tokio::test]
-async fn module_cache_uses_local_archive_when_present() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = ModuleCache::new(tmp.path());
-    let id = ModuleId {
-        hostname: "registry.terraform.io".into(),
-        namespace: "terraform-aws-modules".into(),
-        name: "vpc".into(),
-        system: "aws".into(),
-        version: "5.8.1".into(),
-    };
-    let archive = cache.archive_path(&id);
-    fs::create_dir_all(archive.parent().unwrap()).unwrap();
-    fs::write(&archive, b"local-module").unwrap();
-
-    let resolved = cache
-        .load_or_fetch(&id, "https://example.invalid/unused.tar.gz")
-        .await
-        .unwrap();
-
-    assert_eq!(resolved.path, archive);
-    assert!(!resolved.fetched);
-    assert_eq!(fs::read(resolved.path).unwrap(), b"local-module");
-}
-
-#[tokio::test]
-async fn module_cache_fetches_official_source_when_missing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let upstream = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/module.tar.gz"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes("remote-module"))
-        .mount(&upstream)
-        .await;
-
-    let cache = ModuleCache::new(tmp.path());
-    let id = ModuleId {
-        hostname: "registry.terraform.io".into(),
-        namespace: "terraform-aws-modules".into(),
-        name: "vpc".into(),
-        system: "aws".into(),
-        version: "5.8.1".into(),
-    };
-    let resolved = cache
-        .load_or_fetch(&id, &format!("{}/module.tar.gz", upstream.uri()))
-        .await
-        .unwrap();
-
-    assert!(resolved.fetched);
-    assert_eq!(fs::read(resolved.path).unwrap(), b"remote-module");
-}
-
-#[tokio::test]
-async fn module_cache_rejects_path_traversal_and_non_http_sources() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = ModuleCache::new(tmp.path());
-    let mut id = ModuleId {
-        hostname: "registry.terraform.io".into(),
-        namespace: "terraform-aws-modules".into(),
-        name: "vpc".into(),
-        system: "aws".into(),
-        version: "../outside".into(),
-    };
-
-    assert!(
-        cache
-            .load_or_fetch(&id, "https://example.invalid/module.tar.gz")
-            .await
-            .is_err()
-    );
-
-    id.version = "5.8.1".into();
-    assert!(
-        cache
-            .load_or_fetch(&id, "git::https://github.com/example/module")
-            .await
-            .is_err()
     );
 }

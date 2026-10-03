@@ -23,7 +23,6 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     metadata::{MetadataError, ProviderMetadataStore},
-    module_mirror::{ModuleCache, ModuleId, ModuleRegistryClient},
     provider::ArchiveName,
     storage::{ProviderArchiveKey, ProviderStorage},
 };
@@ -32,8 +31,6 @@ use crate::{
 pub struct AppState {
     pub metadata: ProviderMetadataStore,
     pub provider_storage: ProviderStorage,
-    pub module_cache: ModuleCache,
-    pub module_registry_base: String,
     pub data_dir: Arc<PathBuf>,
 }
 
@@ -48,8 +45,6 @@ impl AppState {
             )
             .expect("test metadata service configuration must be valid"),
             provider_storage: ProviderStorage::new(root),
-            module_cache: ModuleCache::new(root),
-            module_registry_base: "https://registry.terraform.io".to_string(),
             data_dir: Arc::new(root.to_path_buf()),
         }
     }
@@ -57,7 +52,6 @@ impl AppState {
 
 #[derive(Debug, Clone)]
 pub struct RouterOptions {
-    pub enable_module_mirror: bool,
     pub conn_qps: u32,
     pub conn_burst: u32,
 }
@@ -65,7 +59,6 @@ pub struct RouterOptions {
 impl Default for RouterOptions {
     fn default() -> Self {
         Self {
-            enable_module_mirror: false,
             conn_qps: 100,
             conn_burst: 200,
         }
@@ -92,21 +85,11 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> Rou
             limiter.clone(),
             enforce_rate_limit,
         ));
-    let mut router = Router::new()
+    Router::new()
         .route("/readyz", get(readyz))
         .route("/livez", get(livez))
-        .merge(provider_routes);
-    if options.enable_module_mirror {
-        router = router.merge(
-            Router::new()
-                .route(
-                    "/v1/modules/:namespace/:name/:system/:version/download",
-                    get(download_module_archive),
-                )
-                .layer(middleware::from_fn_with_state(limiter, enforce_rate_limit)),
-        );
-    }
-    router.with_state(state)
+        .merge(provider_routes)
+        .with_state(state)
 }
 
 async fn livez() -> &'static str {
@@ -357,45 +340,4 @@ fn metadata_error_response(error: MetadataError) -> axum::response::Response {
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
-}
-
-async fn download_module_archive(
-    State(state): State<AppState>,
-    AxumPath((namespace, name, system, version)): AxumPath<(String, String, String, String)>,
-) -> impl IntoResponse {
-    let id = ModuleId {
-        hostname: "registry.terraform.io".to_string(),
-        namespace,
-        name,
-        system,
-        version,
-    };
-    let registry = ModuleRegistryClient::new(&state.module_registry_base);
-    let download_url = match registry.resolve_download_url(&id).await {
-        Ok(url) => url,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to resolve module download URL");
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-    };
-
-    let resolved = match state.module_cache.load_or_fetch(&id, &download_url).await {
-        Ok(resolved) => resolved,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to load module archive");
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-    };
-
-    let file = match tokio::fs::File::open(&resolved.path).await {
-        Ok(file) => file,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/gzip"),
-    );
-    response
 }

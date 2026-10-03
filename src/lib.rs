@@ -1,6 +1,5 @@
 pub mod http_api;
 pub mod metadata;
-pub mod module_mirror;
 pub mod outbound;
 pub mod provider;
 pub mod registry;

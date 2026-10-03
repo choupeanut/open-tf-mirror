@@ -421,3 +421,36 @@ async fn sync_parent(parent: &Path) -> Result<(), ProviderStorageError> {
 async fn sync_parent(_parent: &Path) -> Result<(), ProviderStorageError> {
     Ok(())
 }
+
+/// Remove `.*.tmp` files left behind by a crash during an archive or metadata
+/// write. Only call this before serving: a running download owns its temp file.
+pub fn remove_stale_temp_files(data_dir: &Path) -> std::io::Result<usize> {
+    fn walk(directory: &Path, removed: &mut usize) -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(&entry.path(), removed)?;
+            } else if file_type.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') && name.ends_with(".tmp") {
+                    std::fs::remove_file(entry.path())?;
+                    *removed += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut removed = 0;
+    for directory in ["providers", "metadata"] {
+        walk(&data_dir.join(directory), &mut removed)?;
+    }
+    Ok(removed)
+}

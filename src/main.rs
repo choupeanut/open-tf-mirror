@@ -23,10 +23,9 @@ use hyper_util::{
 use open_tf_mirror::{
     http_api::{AppState, RouterOptions, build_router_with_options},
     metadata::ProviderMetadataStore,
-    module_mirror::ModuleCache,
     outbound::{OutboundClient, OutboundMode},
     registry::RegistryClient,
-    storage::ProviderStorage,
+    storage::{ProviderStorage, remove_stale_temp_files},
     tls_reload::ReloadingCertResolver,
 };
 use rustls::ServerConfig;
@@ -87,13 +86,6 @@ struct Args {
 
     #[arg(
         long,
-        env = "SERVER_MODULE_REGISTRY_BASE",
-        default_value = "https://registry.terraform.io"
-    )]
-    module_registry_base: String,
-
-    #[arg(
-        long,
         env = "SERVER_ALLOWED_REGISTRIES",
         value_delimiter = ',',
         default_value = "registry.terraform.io"
@@ -112,9 +104,6 @@ struct Args {
 
     #[arg(long, env = "SERVER_UPSTREAM_CA_FILE")]
     upstream_ca_file: Option<PathBuf>,
-
-    #[arg(long, env = "SERVER_ENABLE_MODULE_MIRROR", default_value_t = false, action = ArgAction::Set)]
-    enable_module_mirror: bool,
 
     #[arg(long, default_value_t = false)]
     log_debug: bool,
@@ -157,14 +146,11 @@ async fn main() -> Result<()> {
             bundled_mirror.as_deref(),
             outbound,
         )?,
-        module_cache: ModuleCache::new(&args.data_source_dir),
-        module_registry_base: args.module_registry_base,
         data_dir: Arc::new(args.data_source_dir.clone()),
     };
     let app = build_router_with_options(
         state,
         RouterOptions {
-            enable_module_mirror: args.enable_module_mirror,
             conn_qps: args.conn_qps,
             conn_burst: args.conn_burst,
         },
@@ -235,6 +221,14 @@ async fn prepare_data_dir(root: &Path) -> Result<()> {
         tokio::fs::create_dir_all(&directory)
             .await
             .with_context(|| format!("create cache directory {}", directory.display()))?;
+    }
+    let root_for_cleanup = root.to_path_buf();
+    let removed = tokio::task::spawn_blocking(move || remove_stale_temp_files(&root_for_cleanup))
+        .await
+        .context("join stale temp file cleanup")?
+        .with_context(|| format!("remove stale temp files under {}", root.display()))?;
+    if removed > 0 {
+        tracing::info!(removed, "removed stale temp files from an interrupted run");
     }
     let probe = root.join(format!(".startup-write-test-{}", std::process::id()));
     tokio::fs::write(&probe, b"ok")
@@ -592,14 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_to_terraform_registry_and_disables_module_mirror() {
+    fn cli_defaults_to_terraform_registry() {
         let args = Args::parse_from(["open-tf-mirror", "--enable-tls=false"]);
 
         assert_eq!(args.allowed_registries, vec!["registry.terraform.io"]);
         assert_eq!(args.metadata_ttl_seconds, 1800);
         assert_eq!(args.outbound_mode, OutboundMode::Direct);
         assert_eq!(args.https_redirect_port, None);
-        assert!(!args.enable_module_mirror);
     }
 
     #[test]
