@@ -1,12 +1,15 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
-use reqwest::{Certificate, Client, Response, Url};
+use reqwest::{
+    Certificate, Client, Response, Url,
+    dns::{Addrs, Name, Resolve, Resolving},
+};
 use tokio::net::lookup_host;
 
 const MAX_REDIRECTS: usize = 5;
@@ -48,9 +51,39 @@ pub enum OutboundError {
 #[derive(Debug, Clone)]
 pub struct OutboundClient {
     mode: OutboundMode,
-    ca_bundle: Arc<Vec<Vec<u8>>>,
+    client: Client,
     allow_http: bool,
     allow_non_public_ips: bool,
+}
+
+/// Raised by the resolver when a name resolves to a forbidden address.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ResolvePolicyError(&'static str);
+
+/// Resolver for direct mode: reqwest connects only to the addresses returned
+/// here, so rejecting non-public results prevents DNS rebinding.
+struct PublicOnlyResolver {
+    allow_non_public_ips: bool,
+}
+
+impl Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let allow_non_public_ips = self.allow_non_public_ips;
+        Box::pin(async move {
+            let addresses = lookup_host((name.as_str(), 0))
+                .await?
+                .collect::<Vec<SocketAddr>>();
+            if addresses.is_empty() {
+                return Err(ResolvePolicyError("URL host did not resolve").into());
+            }
+            if !allow_non_public_ips && addresses.iter().any(|address| !is_public_ip(address.ip()))
+            {
+                return Err(ResolvePolicyError("URL resolves to a non-public address").into());
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
 }
 
 impl OutboundClient {
@@ -58,42 +91,54 @@ impl OutboundClient {
         if mode == OutboundMode::TrustedProxy && !proxy_configured() {
             return Err(OutboundError::ProxyRequired);
         }
-        let ca_bundle = match ca_file {
-            Some(path) => {
-                let pem = std::fs::read(path)
-                    .map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
-                let certificates = Certificate::from_pem_bundle(&pem)
-                    .map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
-                if certificates.is_empty() {
-                    return Err(OutboundError::InvalidCa(
-                        "CA bundle does not contain a PEM certificate".into(),
-                    ));
-                }
-                for certificate in certificates {
-                    Client::builder()
-                        .add_root_certificate(certificate)
-                        .build()
-                        .map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
-                }
-                vec![pem]
+        let mut certificates = Vec::new();
+        if let Some(path) = ca_file {
+            let pem =
+                std::fs::read(path).map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
+            certificates = Certificate::from_pem_bundle(&pem)
+                .map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
+            if certificates.is_empty() {
+                return Err(OutboundError::InvalidCa(
+                    "CA bundle does not contain a PEM certificate".into(),
+                ));
             }
-            None => Vec::new(),
-        };
-        Ok(Self {
-            mode,
-            ca_bundle: Arc::new(ca_bundle),
-            allow_http: false,
-            allow_non_public_ips: false,
-        })
+        }
+        Self::build(mode, certificates, false, false)
     }
 
     pub fn for_tests() -> Self {
-        Self {
-            mode: OutboundMode::Direct,
-            ca_bundle: Arc::default(),
-            allow_http: true,
-            allow_non_public_ips: true,
+        Self::build(OutboundMode::Direct, Vec::new(), true, true)
+            .expect("test outbound client builds")
+    }
+
+    fn build(
+        mode: OutboundMode,
+        certificates: Vec<Certificate>,
+        allow_http: bool,
+        allow_non_public_ips: bool,
+    ) -> Result<Self, OutboundError> {
+        let mut builder = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none());
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
         }
+        if mode == OutboundMode::Direct {
+            builder = builder
+                .no_proxy()
+                .dns_resolver(Arc::new(PublicOnlyResolver {
+                    allow_non_public_ips,
+                }));
+        }
+        let client = builder
+            .build()
+            .map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
+        Ok(Self {
+            mode,
+            client,
+            allow_http,
+            allow_non_public_ips,
+        })
     }
 
     pub fn mode(&self) -> OutboundMode {
@@ -106,8 +151,14 @@ impl OutboundClient {
 
     pub async fn get(&self, mut url: Url, timeout: Duration) -> Result<Response, OutboundError> {
         for redirect_count in 0..=MAX_REDIRECTS {
-            let client = self.client_for_url(&url).await?;
-            let response = client.get(url.clone()).timeout(timeout).send().await?;
+            self.validate_url(&url)?;
+            let response = self
+                .client
+                .get(url.clone())
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(map_request_error)?;
             if !is_redirect(response.status()) {
                 return Ok(response);
             }
@@ -134,51 +185,36 @@ impl OutboundClient {
         if url.scheme() != "https" && !(self.allow_http && url.scheme() == "http") {
             return Err(OutboundError::Policy("HTTPS is required".into()));
         }
-        if url.host_str().is_none() {
-            return Err(OutboundError::Policy("URL host is required".into()));
+        let host = url
+            .host_str()
+            .ok_or_else(|| OutboundError::Policy("URL host is required".into()))?;
+        // IP literals bypass the DNS resolver, so check them here.
+        let literal_ip = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .ok();
+        if self.mode == OutboundMode::Direct
+            && !self.allow_non_public_ips
+            && literal_ip.is_some_and(|ip| !is_public_ip(ip))
+        {
+            return Err(OutboundError::Policy(
+                "URL targets a non-public address".into(),
+            ));
         }
         Ok(())
     }
+}
 
-    async fn client_for_url(&self, url: &Url) -> Result<Client, OutboundError> {
-        self.validate_url(url)?;
-        let mut builder = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
-        for pem in self.ca_bundle.iter() {
-            let certificate = Certificate::from_pem(pem)
-                .map_err(|error| OutboundError::InvalidCa(error.to_string()))?;
-            builder = builder.add_root_certificate(certificate);
+fn map_request_error(error: reqwest::Error) -> OutboundError {
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if let Some(policy) = cause.downcast_ref::<ResolvePolicyError>() {
+            return OutboundError::Policy(policy.0.into());
         }
-        if self.mode == OutboundMode::Direct {
-            builder = builder.no_proxy();
-            let host = url
-                .host_str()
-                .ok_or_else(|| OutboundError::Policy("URL host is required".into()))?;
-            let resolver_host = host
-                .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-                .unwrap_or(host);
-            let port = url
-                .port_or_known_default()
-                .ok_or_else(|| OutboundError::Policy("URL port is required".into()))?;
-            let addresses = lookup_host((resolver_host, port))
-                .await?
-                .collect::<Vec<SocketAddr>>();
-            if addresses.is_empty() {
-                return Err(OutboundError::Policy("URL host did not resolve".into()));
-            }
-            if !self.allow_non_public_ips
-                && addresses.iter().any(|address| !is_public_ip(address.ip()))
-            {
-                return Err(OutboundError::Policy(
-                    "URL resolves to a non-public address".into(),
-                ));
-            }
-            builder = builder.resolve_to_addrs(resolver_host, &addresses);
-        }
-        Ok(builder.build()?)
+        source = cause.source();
     }
+    OutboundError::Request(error)
 }
 
 fn proxy_configured() -> bool {
@@ -226,6 +262,18 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 return is_public_ip(IpAddr::V4(ipv4));
             }
             let segments = ip.segments();
+            let embedded_v4 = |high: u16, low: u16| {
+                let [a, b] = high.to_be_bytes();
+                let [c, d] = low.to_be_bytes();
+                Ipv4Addr::new(a, b, c, d)
+            };
+            // NAT64 64:ff9b::/96 and 6to4 2002::/16 embed an IPv4 address.
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return is_public_ip(IpAddr::V4(embedded_v4(segments[6], segments[7])));
+            }
+            if segments[0] == 0x2002 {
+                return is_public_ip(IpAddr::V4(embedded_v4(segments[1], segments[2])));
+            }
             !ip.is_loopback()
                 && !ip.is_unspecified()
                 && !ip.is_multicast()
@@ -234,5 +282,26 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 && (segments[0] & 0xffc0) != 0xfec0
                 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn public(value: &str) -> bool {
+        is_public_ip(value.parse().unwrap())
+    }
+
+    #[test]
+    fn embedded_ipv4_in_nat64_and_6to4_is_checked() {
+        assert!(!public("64:ff9b::7f00:1"));
+        assert!(!public("64:ff9b::a00:1"));
+        assert!(public("64:ff9b::808:808"));
+        assert!(!public("2002:7f00:1::1"));
+        assert!(!public("2002:c0a8:101::"));
+        assert!(public("2002:808:808::1"));
+        assert!(!public("::ffff:127.0.0.1"));
+        assert!(public("2606:4700:4700::1111"));
     }
 }
