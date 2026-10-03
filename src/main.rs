@@ -254,12 +254,18 @@ async fn prepare_data_dir(root: &Path) -> Result<()> {
             .with_context(|| format!("create cache directory {}", directory.display()))?;
     }
     let root_for_cleanup = root.to_path_buf();
-    let removed = tokio::task::spawn_blocking(move || remove_stale_temp_files(&root_for_cleanup))
+    // Cleanup is best effort: a stray unreadable file must not block startup.
+    match tokio::task::spawn_blocking(move || remove_stale_temp_files(&root_for_cleanup))
         .await
         .context("join stale temp file cleanup")?
-        .with_context(|| format!("remove stale temp files under {}", root.display()))?;
-    if removed > 0 {
-        tracing::info!(removed, "removed stale temp files from an interrupted run");
+    {
+        Ok(0) => {}
+        Ok(removed) => {
+            tracing::info!(removed, "removed stale temp files from an interrupted run");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, data_dir = %root.display(), "stale temp file cleanup failed");
+        }
     }
     let probe = root.join(format!(".startup-write-test-{}", std::process::id()));
     tokio::fs::write(&probe, b"ok")

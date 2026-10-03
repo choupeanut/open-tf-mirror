@@ -214,9 +214,14 @@ impl ProviderStorage {
         let key = key.clone();
         let metadata = metadata.clone();
         tokio::spawn(async move {
-            storage
+            let result = storage
                 .locked_load_or_fetch(&key, &metadata, &expected, &destination)
-                .await
+                .await;
+            // Logged here too: every waiting client may already have gone.
+            if let Err(error) = &result {
+                tracing::warn!(error = %error, archive = %key.filename, "provider archive fetch failed");
+            }
+            result
         })
         .await
         .map_err(|error| ProviderStorageError::Io(std::io::Error::other(error)))?
