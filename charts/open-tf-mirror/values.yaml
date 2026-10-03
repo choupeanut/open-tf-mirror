@@ -48,7 +48,7 @@ openTfMirror:
 
   startupProbe:
     initialDelaySeconds: 0
-    timeoutSeconds: 1
+    timeoutSeconds: 5
     periodSeconds: 5
     failureThreshold: 10
     successThreshold: 1

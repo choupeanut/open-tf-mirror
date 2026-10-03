@@ -228,6 +228,21 @@ jobs:
           grep -q -- '--https-port=18443$' /tmp/open-tf-mirror-custom-ports.yaml
           test "$(grep -c -- '--enable-tls=false$' /tmp/open-tf-mirror-custom-ports.yaml)" -eq 1
 
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set 'openTfMirror.env[0].name=HTTPS_PROXY' \
+            --set 'openTfMirror.env[0].value=http://proxy.example:3128' \
+            >/tmp/open-tf-mirror-custom-env.yaml
+          grep -q 'name: TF_PLUGIN_MIRROR_DIR$' /tmp/open-tf-mirror-custom-env.yaml
+          grep -q 'name: HTTPS_PROXY$' /tmp/open-tf-mirror-custom-env.yaml
+          grep -q 'value: "\?http://proxy.example:3128"\?$' /tmp/open-tf-mirror-custom-env.yaml
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.providersMirror.enabled=false \
+            --set 'openTfMirror.env[0].name=HTTPS_PROXY' \
+            --set 'openTfMirror.env[0].value=http://proxy.example:3128' \
+            >/tmp/open-tf-mirror-env-only.yaml
+          grep -q 'name: HTTPS_PROXY$' /tmp/open-tf-mirror-env-only.yaml
+          ! grep -q 'TF_PLUGIN_MIRROR_DIR' /tmp/open-tf-mirror-env-only.yaml
+
       - name: Render chart with Argo CD values shape
         run: |
           image_tag="$(sed -n '/^  image:$/,/^  [a-zA-Z]/{s/^    tag: //p}' charts/open-tf-mirror/values.yaml | head -1)"

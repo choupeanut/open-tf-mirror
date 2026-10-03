@@ -105,7 +105,7 @@ spec:
               value: /usr/share/terraform/providers/plugins
             {{- end }}
             {{- with .Values.openTfMirror.env }}
-            {{- toYaml .Values.openTfMirror.env | nindent 12 }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
           {{- if .Values.openTfMirror.envFrom }}
