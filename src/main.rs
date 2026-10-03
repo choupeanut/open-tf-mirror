@@ -362,6 +362,16 @@ async fn serve_listener(
                     serve_connection(stream, app, &mut connection_shutdown, peer_addr, label).await;
                 }
                 None => {
+                    if !wait_for_protocol_preface(
+                        &stream,
+                        connection_shutdown.clone(),
+                        options.handshake_timeout,
+                    )
+                    .await
+                    {
+                        tracing::debug!(%peer_addr, "HTTP client sent no request in time");
+                        return;
+                    }
                     serve_connection(stream, app, &mut connection_shutdown, peer_addr, label).await;
                 }
             }
@@ -429,6 +439,35 @@ async fn accept_tls_with_timeout(
         result = tokio::time::timeout(handshake_timeout, acceptor.accept(stream)) => {
             result.ok().and_then(Result::ok)
         }
+    }
+}
+
+/// hyper-util's HTTP/1 vs HTTP/2 detection reads the first bytes without any
+/// timeout (`header_read_timeout` only starts afterwards), so a client that
+/// connects and sends nothing, or only part of the HTTP/2 preface, would hold
+/// a connection permit forever. Wait until the protocol is decidable.
+async fn wait_for_protocol_preface(
+    stream: &TcpStream,
+    mut shutdown: watch::Receiver<bool>,
+    timeout: Duration,
+) -> bool {
+    const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let decidable = async {
+        let mut buffer = [0_u8; H2_PREFACE.len()];
+        loop {
+            match stream.peek(&mut buffer).await {
+                Ok(0) | Err(_) => return false,
+                Ok(read) if read == H2_PREFACE.len() || buffer[..read] != H2_PREFACE[..read] => {
+                    return true;
+                }
+                // A partial HTTP/2 preface: `peek` returns immediately, so poll.
+                Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    };
+    tokio::select! {
+        _ = shutdown_requested(&mut shutdown) => false,
+        result = tokio::time::timeout(timeout, decidable) => result.unwrap_or(false),
     }
 }
 
@@ -843,6 +882,51 @@ mod tests {
             .await
             .expect("second connection should be served after the first closes");
         assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_silent_and_partial_preface_connections_release_their_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(serve_listener(
+            listener,
+            None,
+            app,
+            1,
+            shutdown_rx,
+            ServeOptions {
+                handshake_timeout: Duration::from_millis(200),
+                shutdown_grace_period: Duration::from_secs(1),
+            },
+        ));
+
+        for stall in [&b""[..], &b"PRI * HTTP"[..]] {
+            // This connection sends nothing (or a partial HTTP/2 preface) and
+            // would otherwise hold the only permit forever.
+            let mut idle = TcpStream::connect(addr).await.unwrap();
+            idle.write_all(stall).await.unwrap();
+            sleep(Duration::from_millis(50)).await;
+
+            let mut second = TcpStream::connect(addr).await.unwrap();
+            second
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let response = timeout(Duration::from_secs(2), read_headers(&mut second))
+                .await
+                .expect("a stalled connection must not hold the permit indefinitely");
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+            drop(idle);
+        }
 
         shutdown_tx.send(true).unwrap();
         timeout(Duration::from_secs(2), server)
