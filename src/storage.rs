@@ -9,11 +9,11 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as SyncMutex, RwLock};
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     sync::{Mutex, Semaphore},
 };
 
@@ -25,6 +25,8 @@ use crate::{
 
 const MAX_PROVIDER_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONCURRENT_DOWNLOADS: usize = 8;
+const MAX_VERIFIED_ENTRIES: usize = 16384;
+const HASH_BUFFER_BYTES: usize = 256 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -57,6 +59,39 @@ pub enum ProviderStorageError {
     Io(#[from] std::io::Error),
 }
 
+/// Identity of a file as observed from its metadata. Archives are only
+/// published by atomic rename, so any content replacement changes this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedFile {
+    identity: FileIdentity,
+    checksum: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderStorage {
     root: Arc<PathBuf>,
@@ -65,6 +100,7 @@ pub struct ProviderStorage {
     max_archive_bytes: u64,
     outbound: OutboundClient,
     download_limit: Arc<Semaphore>,
+    verified: Arc<SyncMutex<HashMap<PathBuf, VerifiedFile>>>,
 }
 
 impl ProviderStorage {
@@ -133,6 +169,7 @@ impl ProviderStorage {
             max_archive_bytes,
             outbound,
             download_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
+            verified: Arc::default(),
         })
     }
 
@@ -171,23 +208,59 @@ impl ProviderStorage {
             return Ok(destination);
         }
 
+        // The download runs in a detached task so a disconnecting client does
+        // not cancel it; later waiters then see the cache hit.
+        let storage = self.clone();
+        let key = key.clone();
+        let metadata = metadata.clone();
+        tokio::spawn(async move {
+            storage
+                .locked_load_or_fetch(&key, &metadata, &expected, &destination)
+                .await
+        })
+        .await
+        .map_err(|error| ProviderStorageError::Io(std::io::Error::other(error)))?
+    }
+
+    async fn locked_load_or_fetch(
+        &self,
+        key: &ProviderArchiveKey,
+        metadata: &PlatformMetadata,
+        expected: &str,
+        destination: &Path,
+    ) -> Result<PathBuf, ProviderStorageError> {
         let lock = self.lock_for(key);
         let _guard = lock.mutex.lock().await;
         if let Some(path) = self.bundled_path(key)
-            && self.archive_matches_checksum(&path, &expected).await?
+            && self.archive_matches_checksum(&path, expected).await?
         {
             return Ok(path);
         }
-        if self
-            .archive_matches_checksum(&destination, &expected)
-            .await?
-        {
-            return Ok(destination);
+        if self.archive_matches_checksum(destination, expected).await? {
+            return Ok(destination.to_path_buf());
         }
 
-        self.download(key, metadata, &expected, &destination)
-            .await?;
-        Ok(destination)
+        self.download(key, metadata, expected, destination).await?;
+        Ok(destination.to_path_buf())
+    }
+
+    #[doc(hidden)]
+    pub fn verified_entry_count(&self) -> usize {
+        self.verified.lock().len()
+    }
+
+    fn record_verified(&self, path: &Path, identity: FileIdentity, checksum: &str) {
+        let mut verified = self.verified.lock();
+        if verified.len() >= MAX_VERIFIED_ENTRIES && !verified.contains_key(path) {
+            verified.clear();
+        }
+        verified.insert(
+            path.to_path_buf(),
+            VerifiedFile {
+                identity,
+                checksum: checksum.to_string(),
+            },
+        );
     }
 
     async fn archive_matches_checksum(
@@ -200,33 +273,34 @@ impl ProviderStorage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        if !metadata.file_type().is_file() {
+        if !metadata.file_type().is_file() || metadata.len() > self.max_archive_bytes {
             return Ok(false);
         }
-        let mut file = match tokio::fs::File::open(path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        let length = file.metadata().await?.len();
-        if length > self.max_archive_bytes {
-            return Ok(false);
+        let identity = FileIdentity::from_metadata(&metadata);
+        if self
+            .verified
+            .lock()
+            .get(path)
+            .is_some_and(|entry| entry.identity == identity && entry.checksum == expected)
+        {
+            return Ok(true);
         }
-        let mut hasher = Sha256::new();
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
+
+        let owned_path = path.to_path_buf();
+        let max = self.max_archive_bytes;
+        let hashed = tokio::task::spawn_blocking(move || hash_file(&owned_path, max))
+            .await
+            .map_err(std::io::Error::other)??;
+        match hashed {
+            Some((actual, identity)) if actual == expected => {
+                self.record_verified(path, identity, expected);
+                Ok(true)
             }
-            total = total.saturating_add(read as u64);
-            if total > self.max_archive_bytes {
-                return Ok(false);
+            _ => {
+                self.verified.lock().remove(path);
+                Ok(false)
             }
-            hasher.update(&buffer[..read]);
         }
-        Ok(hex::encode(hasher.finalize()) == expected)
     }
 
     fn bundled_path(&self, key: &ProviderArchiveKey) -> Option<PathBuf> {
@@ -324,8 +398,49 @@ impl ProviderStorage {
         tokio::fs::rename(&temp_path, destination).await?;
         cleanup.disarm();
         sync_parent(parent).await?;
+        if let Ok(metadata) = tokio::fs::symlink_metadata(destination).await
+            && metadata.file_type().is_file()
+        {
+            self.record_verified(
+                destination,
+                FileIdentity::from_metadata(&metadata),
+                expected,
+            );
+        }
         Ok(())
     }
+}
+
+/// Hashes a file, returning `None` when it is missing, not regular or too
+/// large. The identity is taken from the opened file so it describes the
+/// bytes that were hashed.
+fn hash_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<(String, FileIdentity)>> {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Ok(None);
+    }
+    let identity = FileIdentity::from_metadata(&metadata);
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Ok(None);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Some((hex::encode(hasher.finalize()), identity)))
 }
 
 struct ManagedArchiveLock {

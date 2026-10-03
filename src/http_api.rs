@@ -301,7 +301,14 @@ async fn download_provider_archive(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
+    let length = match file.metadata().await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/zip"),

@@ -377,3 +377,104 @@ fn stale_temp_files_are_removed_at_startup() {
     assert!(metadata_dir.join("index.json").exists());
     assert_eq!(std::fs::read_dir(&provider_dir).unwrap().count(), 1);
 }
+
+#[tokio::test]
+async fn replaced_cached_archive_is_detected_after_being_memoized() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let body = b"verified archive";
+    Mock::given(method("GET"))
+        .and(path("/provider.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+    let storage = ProviderStorage::new_for_tests(temp.path(), None::<&Path>, 1024 * 1024).unwrap();
+    let filename = "terraform-provider-random_3.6.2_linux_amd64.zip";
+    let archive = storage.archive_path(&key(filename));
+    let metadata = metadata(format!("{}/provider.zip", server.uri()), body);
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    fs::write(&archive, body).unwrap();
+
+    storage
+        .load_or_fetch(&key(filename), &metadata)
+        .await
+        .unwrap();
+    assert_eq!(storage.verified_entry_count(), 1);
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    fs::write(&archive, b"corrupt and longer than the original").unwrap();
+    storage
+        .load_or_fetch(&key(filename), &metadata)
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(&archive).unwrap(), body);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn second_cache_hit_uses_verified_memo() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = ProviderStorage::new_for_tests(temp.path(), None::<&Path>, 1024 * 1024).unwrap();
+    let filename = "terraform-provider-random_3.6.2_linux_amd64.zip";
+    let archive = storage.archive_path(&key(filename));
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    fs::write(&archive, b"cached").unwrap();
+    let metadata = metadata("http://127.0.0.1:1/unused".into(), b"cached");
+
+    assert_eq!(storage.verified_entry_count(), 0);
+    storage
+        .load_or_fetch(&key(filename), &metadata)
+        .await
+        .unwrap();
+    assert_eq!(storage.verified_entry_count(), 1);
+    storage
+        .load_or_fetch(&key(filename), &metadata)
+        .await
+        .unwrap();
+    assert_eq!(storage.verified_entry_count(), 1);
+}
+
+#[tokio::test]
+async fn aborting_the_caller_does_not_cancel_the_download() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let body = b"slow verified archive";
+    Mock::given(method("GET"))
+        .and(path("/provider.zip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body)
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&server)
+        .await;
+    let storage =
+        Arc::new(ProviderStorage::new_for_tests(temp.path(), None::<&Path>, 1024 * 1024).unwrap());
+    let filename = "terraform-provider-random_3.6.2_linux_amd64.zip";
+    let archive = storage.archive_path(&key(filename));
+    let metadata = metadata(format!("{}/provider.zip", server.uri()), body);
+
+    let caller = {
+        let storage = Arc::clone(&storage);
+        tokio::spawn(async move { storage.load_or_fetch(&key(filename), &metadata).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    caller.abort();
+    let _ = caller.await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let done = fs::read(&archive).is_ok_and(|content| content == body)
+            && storage.active_lock_count() == 0;
+        if done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "download was cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}

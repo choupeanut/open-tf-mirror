@@ -231,6 +231,7 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "application/zip");
+    assert_eq!(response.headers()["content-length"], "8");
     assert_eq!(
         response.headers()["content-disposition"],
         format!("attachment; filename=\"{filename}\"")
