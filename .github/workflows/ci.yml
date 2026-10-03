@@ -82,7 +82,7 @@ jobs:
           set -euo pipefail
           grep -Eq '^FROM rust:1\.88-slim-bookworm@sha256:[a-f0-9]{64} AS builder$' Dockerfile
           grep -Eq '^FROM debian:bookworm-slim@sha256:[a-f0-9]{64} AS runtime$' Dockerfile
-          ! grep -Eq 'apt-get|useradd|groupadd' Dockerfile
+          if grep -Eq 'apt-get|useradd|groupadd' Dockerfile; then exit 1; fi
           local_tag="$IMAGE_REPOSITORY:test-$GITHUB_SHA"
           docker build --tag "$local_tag" .
           if [[ -n "$RELEASE_VERSION" ]]; then
@@ -134,10 +134,18 @@ jobs:
 
       - name: Verify hardened default render
         run: |
+          image_repository="$(sed -n '/^  image:$/,/^  [a-zA-Z]/{s/^    repository: //p}' charts/open-tf-mirror/values.yaml | head -1)"
+          image_tag="$(sed -n '/^  image:$/,/^  [a-zA-Z]/{s/^    tag: //p}' charts/open-tf-mirror/values.yaml | head -1)"
+          test -n "$image_repository"
+          test -n "$image_tag"
           helm template open-tf-mirror charts/open-tf-mirror \
             --namespace open-tf-mirror \
             >/tmp/open-tf-mirror-default.yaml
-          grep -q 'image: peanutchou/open-tf-mirror:0.2.0$' /tmp/open-tf-mirror-default.yaml
+          grep -q "image: ${image_repository}:${image_tag}$" /tmp/open-tf-mirror-default.yaml
+          grep -q -- '--http-port=8080$' /tmp/open-tf-mirror-default.yaml
+          grep -q -- '--https-port=8443$' /tmp/open-tf-mirror-default.yaml
+          grep -q -- '--https-redirect-port=443$' /tmp/open-tf-mirror-default.yaml
+          grep -q 'terminationGracePeriodSeconds: 30$' /tmp/open-tf-mirror-default.yaml
           grep -q '^      initContainers:$' /tmp/open-tf-mirror-default.yaml
           grep -q 'runAsUser: 10001$' /tmp/open-tf-mirror-default.yaml
           grep -q 'runAsGroup: 10001$' /tmp/open-tf-mirror-default.yaml
@@ -147,14 +155,14 @@ jobs:
           grep -q 'type: RuntimeDefault$' /tmp/open-tf-mirror-default.yaml
           grep -q 'drop:$' /tmp/open-tf-mirror-default.yaml
           grep -q -- '- ALL$' /tmp/open-tf-mirror-default.yaml
-          ! grep -q 'shareProcessNamespace:' /tmp/open-tf-mirror-default.yaml
-          ! grep -q 'sleep infinity' /tmp/open-tf-mirror-default.yaml
-          ! grep -q '/proc/$(cat /pids/providers-mirror)' /tmp/open-tf-mirror-default.yaml
+          if grep -q 'shareProcessNamespace:' /tmp/open-tf-mirror-default.yaml; then exit 1; fi
+          if grep -q 'sleep infinity' /tmp/open-tf-mirror-default.yaml; then exit 1; fi
+          if grep -q '/proc/$(cat /pids/providers-mirror)' /tmp/open-tf-mirror-default.yaml; then exit 1; fi
           grep -q 'cp -R /usr/share/terraform/providers/plugins/. /providers-mirror/' /tmp/open-tf-mirror-default.yaml
           grep -q 'name: TF_PLUGIN_MIRROR_DIR$' /tmp/open-tf-mirror-default.yaml
           grep -q 'value: /usr/share/terraform/providers/plugins$' /tmp/open-tf-mirror-default.yaml
           cp -R charts/open-tf-mirror /tmp/open-tf-mirror-upgrade
-          sed -i 's/^version: 0.2.0$/version: 9.9.9/' /tmp/open-tf-mirror-upgrade/Chart.yaml
+          sed -i 's/^version: .*/version: 9.9.9/' /tmp/open-tf-mirror-upgrade/Chart.yaml
           helm template open-tf-mirror /tmp/open-tf-mirror-upgrade \
             --namespace open-tf-mirror \
             --set commonLabels.upgrade-probe=changed \
@@ -169,8 +177,8 @@ jobs:
           grep -q 'app.kubernetes.io/name: open-tf-mirror$' /tmp/open-tf-mirror-selector-before.yaml
           grep -q 'app.kubernetes.io/instance: open-tf-mirror$' /tmp/open-tf-mirror-selector-before.yaml
           grep -q 'app.kubernetes.io/component: server$' /tmp/open-tf-mirror-selector-before.yaml
-          ! grep -q 'helm.sh/chart:' /tmp/open-tf-mirror-selector-before.yaml
-          ! grep -q 'upgrade-probe:' /tmp/open-tf-mirror-selector-before.yaml
+          if grep -q 'helm.sh/chart:' /tmp/open-tf-mirror-selector-before.yaml; then exit 1; fi
+          if grep -q 'upgrade-probe:' /tmp/open-tf-mirror-selector-before.yaml; then exit 1; fi
           if helm template open-tf-mirror charts/open-tf-mirror \
             --set openTfMirror.tls.enabled=true \
             >/dev/null 2>&1; then
@@ -178,13 +186,71 @@ jobs:
             exit 1
           fi
 
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.replicas=2 \
+            --set-json 'openTfMirror.pdb={"enabled":true,"maxUnavailable":0}' \
+            >/tmp/open-tf-mirror-pdb.yaml
+          grep -q '^  maxUnavailable: 0$' /tmp/open-tf-mirror-pdb.yaml
+          if grep -q '^  minAvailable:' /tmp/open-tf-mirror-pdb.yaml; then exit 1; fi
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.replicas=2 \
+            --set-json 'openTfMirror.pdb={"enabled":true,"minAvailable":0}' \
+            >/tmp/open-tf-mirror-pdb-min-zero.yaml
+          grep -q '^  minAvailable: 0$' /tmp/open-tf-mirror-pdb-min-zero.yaml
+          if helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.replicas=2 \
+            --set-json 'openTfMirror.pdb={"enabled":true,"minAvailable":1,"maxUnavailable":0}' \
+            >/dev/null 2>&1; then
+            echo "PDB minAvailable and maxUnavailable must be mutually exclusive" >&2
+            exit 1
+          fi
+
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set global.imagePullSecrets[0]=registry-credentials \
+            --set global.imagePullSecrets[1].name=another-registry \
+            >/tmp/open-tf-mirror-image-pull-secrets.yaml
+          grep -q '        - name: "registry-credentials"$' /tmp/open-tf-mirror-image-pull-secrets.yaml
+          grep -q '        - name: "another-registry"$' /tmp/open-tf-mirror-image-pull-secrets.yaml
+
+          long_name="$(printf 'r%.0s' {1..63})"
+          helm template long-release charts/open-tf-mirror \
+            --set fullnameOverride="$long_name" \
+            >/tmp/open-tf-mirror-long-name.yaml
+          awk '/^  name: / { name=$2 } /^        - name: / { name=$3 } { gsub(/"/, "", name); if (length(name) > 63) exit 1 }' \
+            /tmp/open-tf-mirror-long-name.yaml
+
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.service.targetPorts.http=18080 \
+            --set openTfMirror.service.targetPorts.https=18443 \
+            --set openTfMirror.args[0]=--enable-tls=false \
+            >/tmp/open-tf-mirror-custom-ports.yaml
+          grep -q -- '--http-port=18080$' /tmp/open-tf-mirror-custom-ports.yaml
+          grep -q -- '--https-port=18443$' /tmp/open-tf-mirror-custom-ports.yaml
+          test "$(grep -c -- '--enable-tls=false$' /tmp/open-tf-mirror-custom-ports.yaml)" -eq 1
+
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set 'openTfMirror.env[0].name=HTTPS_PROXY' \
+            --set 'openTfMirror.env[0].value=http://proxy.example:3128' \
+            >/tmp/open-tf-mirror-custom-env.yaml
+          grep -q 'name: TF_PLUGIN_MIRROR_DIR$' /tmp/open-tf-mirror-custom-env.yaml
+          grep -q 'name: HTTPS_PROXY$' /tmp/open-tf-mirror-custom-env.yaml
+          grep -q 'value: "\?http://proxy.example:3128"\?$' /tmp/open-tf-mirror-custom-env.yaml
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.providersMirror.enabled=false \
+            --set 'openTfMirror.env[0].name=HTTPS_PROXY' \
+            --set 'openTfMirror.env[0].value=http://proxy.example:3128' \
+            >/tmp/open-tf-mirror-env-only.yaml
+          grep -q 'name: HTTPS_PROXY$' /tmp/open-tf-mirror-env-only.yaml
+          if grep -q 'TF_PLUGIN_MIRROR_DIR' /tmp/open-tf-mirror-env-only.yaml; then exit 1; fi
+
       - name: Render chart with Argo CD values shape
         run: |
+          image_tag="$(sed -n '/^  image:$/,/^  [a-zA-Z]/{s/^    tag: //p}' charts/open-tf-mirror/values.yaml | head -1)"
           helm template open-tf-mirror charts/open-tf-mirror \
             --namespace open-tf-mirror \
             --set fullnameOverride=open-tf-mirror \
             --set openTfMirror.image.repository=peanutchou/open-tf-mirror \
-            --set openTfMirror.image.tag=0.2.0 \
+            --set openTfMirror.image.tag="$image_tag" \
             --set openTfMirror.replicas=2 \
             --set openTfMirror.args[0]=--log-debug \
             --set openTfMirror.args[1]=--log-verbosity=4 \
@@ -203,7 +269,14 @@ jobs:
           grep -q 'containerPort: 8080$' /tmp/open-tf-mirror-rendered.yaml
           grep -q 'containerPort: 8443$' /tmp/open-tf-mirror-rendered.yaml
           grep -q -- '--tls-private-key-file=/etc/open-tf-mirror/ssl/tls.key' /tmp/open-tf-mirror-rendered.yaml
-          ! grep -q -- '--tls-auto-cert-domains' /tmp/open-tf-mirror-rendered.yaml
+          if grep -q -- '--tls-auto-cert-domains' /tmp/open-tf-mirror-rendered.yaml; then exit 1; fi
+
+          helm template open-tf-mirror charts/open-tf-mirror \
+            --set openTfMirror.upstreamCA.secretName=open-tf-mirror-upstream-ca \
+            >/tmp/open-tf-mirror-upstream-ca.yaml
+          grep -q -- '--upstream-ca-file=/etc/open-tf-mirror/upstream-ca/ca.crt' /tmp/open-tf-mirror-upstream-ca.yaml
+          grep -q 'secretName: open-tf-mirror-upstream-ca$' /tmp/open-tf-mirror-upstream-ca.yaml
+          grep -q 'key: ca.crt$' /tmp/open-tf-mirror-upstream-ca.yaml
 
       - name: Package chart
         run: |

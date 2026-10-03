@@ -1,16 +1,16 @@
 apiVersion: v2
-appVersion: 0.2.0
+appVersion: 0.3.1
 description: A Helm chart for open-tf-mirror.
 home: https://github.com/choupeanut/open-tf-mirror
 keywords:
   - terraform provider mirror
   - open-tf-mirror
-kubeVersion: ">=1.19.0-0"
+kubeVersion: ">=1.21.0-0"
 name: open-tf-mirror
 sources:
   - https://github.com/choupeanut/open-tf-mirror
 type: application
-version: 0.2.0
+version: 0.3.1
 annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/links: |

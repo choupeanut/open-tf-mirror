@@ -1,7 +1,7 @@
 use std::{fs, path::Path, time::Duration};
 
 use open_tf_mirror::tls_reload::ReloadingCertResolver;
-use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rcgen::{CertificateParams, CertifiedKey, KeyPair, date_time_ymd, generate_simple_self_signed};
 use rustls::sign::CertifiedKey as RustlsCertifiedKey;
 
 fn write_cert_pair(dir: &Path, name: &str) -> Vec<u8> {
@@ -12,6 +12,24 @@ fn write_cert_pair(dir: &Path, name: &str) -> Vec<u8> {
 
     fs::write(dir.join(format!("{name}.crt")), cert_pem).unwrap();
     fs::write(dir.join(format!("{name}.key")), key_pem).unwrap();
+
+    cert.der().to_vec()
+}
+
+fn write_cert_pair_with_validity(
+    dir: &Path,
+    name: &str,
+    not_before_year: i32,
+    not_after_year: i32,
+) -> Vec<u8> {
+    let mut params = CertificateParams::new(vec![format!("{name}.example.test")]).unwrap();
+    params.not_before = date_time_ymd(not_before_year, 1, 1);
+    params.not_after = date_time_ymd(not_after_year, 1, 1);
+    let signing_key = KeyPair::generate().unwrap();
+    let cert = params.self_signed(&signing_key).unwrap();
+
+    fs::write(dir.join(format!("{name}.crt")), cert.pem()).unwrap();
+    fs::write(dir.join(format!("{name}.key")), signing_key.serialize_pem()).unwrap();
 
     cert.der().to_vec()
 }
@@ -59,6 +77,32 @@ fn new_rejects_certificate_and_private_key_that_do_not_match() {
             .expect_err("a certificate and unrelated private key must be rejected");
 
     assert!(error.to_string().contains("match"));
+}
+
+#[test]
+fn new_rejects_expired_certificate() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cert_pair_with_validity(tmp.path(), "expired", 2020, 2021);
+
+    let error = ReloadingCertResolver::new(
+        tmp.path().join("expired.crt"),
+        tmp.path().join("expired.key"),
+    )
+    .expect_err("an expired certificate must not start the resolver");
+
+    assert!(error.to_string().contains("expired"));
+}
+
+#[test]
+fn new_rejects_certificate_that_is_not_valid_yet() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cert_pair_with_validity(tmp.path(), "future", 2030, 2031);
+
+    let error =
+        ReloadingCertResolver::new(tmp.path().join("future.crt"), tmp.path().join("future.key"))
+            .expect_err("a not-yet-valid certificate must not start the resolver");
+
+    assert!(error.to_string().contains("not valid yet"));
 }
 
 #[test]
@@ -130,6 +174,29 @@ fn resolver_falls_back_to_last_good_certificate_when_reload_fails() {
     assert_eq!(leaf_cert_der(&initially_resolved), first_cert);
 
     fs::write(&live_cert, "not a certificate").unwrap();
+
+    let fallback = resolver.resolve_current_cert();
+    assert_eq!(leaf_cert_der(&fallback), first_cert);
+}
+
+#[test]
+fn resolver_keeps_last_good_certificate_when_replacement_is_expired() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first_cert = write_cert_pair(tmp.path(), "first");
+    write_cert_pair_with_validity(tmp.path(), "expired", 2020, 2021);
+
+    let live_cert = tmp.path().join("live.crt");
+    let live_key = tmp.path().join("live.key");
+    fs::copy(tmp.path().join("first.crt"), &live_cert).unwrap();
+    fs::copy(tmp.path().join("first.key"), &live_key).unwrap();
+
+    let resolver =
+        ReloadingCertResolver::new_with_reload_interval(&live_cert, &live_key, Duration::ZERO)
+            .unwrap();
+    assert_eq!(leaf_cert_der(&resolver.resolve_current_cert()), first_cert);
+
+    fs::copy(tmp.path().join("expired.crt"), &live_cert).unwrap();
+    fs::copy(tmp.path().join("expired.key"), &live_key).unwrap();
 
     let fallback = resolver.resolve_current_cert();
     assert_eq!(leaf_cert_der(&fallback), first_cert);

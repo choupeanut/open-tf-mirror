@@ -68,6 +68,21 @@ open-tf-mirror resource name.
 {{- end -}}
 
 {{/*
+Create a DNS-label-safe headless Service name. The suffix is part of the
+resource name, so reserve room for the suffix instead of truncating it away.
+*/}}
+{{- define "open-tf-mirror.headlessName" -}}
+{{- printf "%s-headless" (include "open-tf-mirror.name" . | trunc 54 | trimSuffix "-") -}}
+{{- end -}}
+
+{{/*
+Create a DNS-label-safe provider-copy init-container name.
+*/}}
+{{- define "open-tf-mirror.providersMirrorName" -}}
+{{- printf "%s-providers-mirror" (include "open-tf-mirror.name" . | trunc 46 | trimSuffix "-") -}}
+{{- end -}}
+
+{{/*
 Common labels.
 */}}
 {{- define "open-tf-mirror.labels" -}}

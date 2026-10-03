@@ -7,10 +7,6 @@ use open_tf_mirror::{
 };
 use std::fs;
 use tower::ServiceExt;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
 
 #[tokio::test]
 async fn health_endpoints_are_compatible_with_existing_probes() {
@@ -48,7 +44,7 @@ async fn readiness_fails_when_data_directory_disappears() {
 }
 
 #[tokio::test]
-async fn module_mirror_is_disabled_by_default() {
+async fn module_routes_are_not_served() {
     let app = build_router(AppState::for_tests(tempfile::tempdir().unwrap().path()));
 
     let response = app
@@ -71,7 +67,6 @@ async fn provider_api_enforces_configured_burst_limit() {
         RouterOptions {
             conn_qps: 1,
             conn_burst: 1,
-            ..RouterOptions::default()
         },
     );
     let request = || {
@@ -105,8 +100,6 @@ async fn provider_index_json_returns_versions_object() {
     let app = build_router(AppState {
         metadata,
         provider_storage: ProviderStorage::new(tmp.path()),
-        module_cache: open_tf_mirror::module_mirror::ModuleCache::new(tmp.path()),
-        module_registry_base: "https://registry.terraform.io".into(),
         data_dir: std::sync::Arc::new(tmp.path().to_path_buf()),
     });
 
@@ -165,8 +158,6 @@ async fn provider_version_json_returns_relative_download_archives() {
     let app = build_router(AppState {
         metadata,
         provider_storage: ProviderStorage::new(tmp.path()),
-        module_cache: open_tf_mirror::module_mirror::ModuleCache::new(tmp.path()),
-        module_registry_base: "https://registry.terraform.io".into(),
         data_dir: std::sync::Arc::new(tmp.path().to_path_buf()),
     });
 
@@ -209,7 +200,7 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
             os: "linux".into(),
             arch: "amd64".into(),
             filename: filename.into(),
-            shasum: None,
+            shasum: Some("4880130a58b9b6c31a056e79db0dc17e8bbfb1e0ac4da3ede76788cc27d74014".into()),
             download_url: "https://releases.hashicorp.com/example.zip".into(),
         }],
     });
@@ -223,8 +214,6 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
     let app = build_router(AppState {
         metadata,
         provider_storage: storage,
-        module_cache: open_tf_mirror::module_mirror::ModuleCache::new(tmp.path()),
-        module_registry_base: "https://registry.terraform.io".into(),
         data_dir: std::sync::Arc::new(tmp.path().to_path_buf()),
     });
 
@@ -242,6 +231,7 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "application/zip");
+    assert_eq!(response.headers()["content-length"], "8");
     assert_eq!(
         response.headers()["content-disposition"],
         format!("attachment; filename=\"{filename}\"")
@@ -250,60 +240,4 @@ async fn provider_download_streams_cached_archive_with_zip_headers() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"zip-body");
-}
-
-#[tokio::test]
-async fn module_download_fetches_from_registry_when_local_cache_is_missing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let registry = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(
-            "/v1/modules/terraform-aws-modules/vpc/aws/5.8.1/download",
-        ))
-        .respond_with(ResponseTemplate::new(204).insert_header(
-            "X-Terraform-Get",
-            format!("{}/archives/vpc.tar.gz", registry.uri()),
-        ))
-        .mount(&registry)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/archives/vpc.tar.gz"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes("module-archive"))
-        .mount(&registry)
-        .await;
-
-    let mut state = AppState::for_tests(tmp.path());
-    state.module_registry_base = registry.uri();
-    let app = build_router_with_options(
-        state,
-        RouterOptions {
-            enable_module_mirror: true,
-            ..RouterOptions::default()
-        },
-    );
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/modules/terraform-aws-modules/vpc/aws/5.8.1/download")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(&body[..], b"module-archive");
-    assert_eq!(
-        fs::read(
-            tmp.path().join(
-                "data/modules/registry.terraform.io/terraform-aws-modules/vpc/aws/5.8.1.tar.gz"
-            )
-        )
-        .unwrap(),
-        b"module-archive"
-    );
 }

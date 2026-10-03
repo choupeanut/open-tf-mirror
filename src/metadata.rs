@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{StreamExt, stream};
@@ -58,6 +58,8 @@ pub enum MetadataError {
     Io(#[from] std::io::Error),
     #[error("invalid persisted metadata: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("metadata refresh is temporarily backed off")]
+    RefreshBackoff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,14 +78,30 @@ struct VersionKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry<T> {
     fetched_at: u64,
+    #[serde(default = "default_complete")]
+    complete: bool,
     value: T,
 }
 
 impl<T> CacheEntry<T> {
-    fn fresh(&self, freshness: Duration) -> bool {
-        now_epoch().saturating_sub(self.fetched_at) < freshness.as_secs()
+    fn fresh(&self, freshness: Duration, partial_retry: Duration) -> bool {
+        let ttl = if self.complete {
+            freshness
+        } else {
+            partial_retry
+        };
+        now_epoch().saturating_sub(self.fetched_at) < ttl.as_secs()
     }
 }
+
+fn default_complete() -> bool {
+    true
+}
+
+// Cache entries are shared behind `Arc` so a cache hit is a refcount bump
+// instead of a deep copy of the whole index (thousands of versions/platforms).
+type IndexEntry = Arc<CacheEntry<Vec<RegistryVersion>>>;
+type VersionEntry = Arc<CacheEntry<VersionMetadata>>;
 
 #[derive(Debug, Clone)]
 pub struct ProviderMetadataService {
@@ -91,10 +109,14 @@ pub struct ProviderMetadataService {
     allowed_registries: Arc<HashSet<String>>,
     freshness: Duration,
     registry: RegistryClient,
-    indices: Arc<RwLock<HashMap<ProviderKey, CacheEntry<Vec<RegistryVersion>>>>>,
-    versions: Arc<RwLock<HashMap<VersionKey, CacheEntry<VersionMetadata>>>>,
+    indices: Arc<RwLock<HashMap<ProviderKey, IndexEntry>>>,
+    versions: Arc<RwLock<HashMap<VersionKey, VersionEntry>>>,
     index_locks: KeyLockMap<ProviderKey>,
     version_locks: KeyLockMap<VersionKey>,
+    index_failures: Arc<RwLock<HashMap<ProviderKey, Instant>>>,
+    version_failures: Arc<RwLock<HashMap<VersionKey, Instant>>>,
+    index_miss_refreshes: Arc<RwLock<HashMap<ProviderKey, Instant>>>,
+    refresh_backoff: Duration,
     syncing: Arc<AtomicBool>,
 }
 
@@ -157,6 +179,10 @@ impl ProviderMetadataService {
             versions: Arc::default(),
             index_locks: Arc::default(),
             version_locks: Arc::default(),
+            index_failures: Arc::default(),
+            version_failures: Arc::default(),
+            index_miss_refreshes: Arc::default(),
+            refresh_backoff: Duration::from_secs(30),
             syncing: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -173,16 +199,20 @@ impl ProviderMetadataService {
         };
         self.versions.write().insert(
             key,
-            CacheEntry {
+            Arc::new(CacheEntry {
                 fetched_at: now_epoch(),
+                complete: true,
                 value: version.clone(),
-            },
+            }),
         );
         let mut indices = self.indices.write();
-        let entry = indices.entry(provider).or_insert_with(|| CacheEntry {
-            fetched_at: now_epoch(),
-            value: Vec::new(),
-        });
+        let entry = Arc::make_mut(indices.entry(provider).or_insert_with(|| {
+            Arc::new(CacheEntry {
+                fetched_at: now_epoch(),
+                complete: true,
+                value: Vec::new(),
+            })
+        }));
         if !entry
             .value
             .iter()
@@ -212,10 +242,12 @@ impl ProviderMetadataService {
         let entry = self.load_index(&key).await?;
         let mut versions = entry
             .value
+            .iter()
+            .map(|item| normalize_version(&item.version))
+            .collect::<HashSet<_>>()
             .into_iter()
-            .map(|item| item.version)
             .collect::<Vec<_>>();
-        versions.sort();
+        versions.sort_by(|a, b| compare_versions(a, b));
         Ok(versions)
     }
 
@@ -226,14 +258,27 @@ impl ProviderMetadataService {
         provider_type: &str,
         version: &str,
     ) -> Result<Option<VersionMetadata>, MetadataError> {
-        validate_component(version, "version")?;
+        Ok(self
+            .get_version_entry(hostname, namespace, provider_type, version)
+            .await?
+            .map(|entry| entry.value.clone()))
+    }
+
+    async fn get_version_entry(
+        &self,
+        hostname: &str,
+        namespace: &str,
+        provider_type: &str,
+        version: &str,
+    ) -> Result<Option<VersionEntry>, MetadataError> {
+        validate_version(version, "version")?;
         let provider = self.provider_key(hostname, namespace, provider_type)?;
         let key = VersionKey {
             provider,
-            version: version.trim_start_matches('v').to_string(),
+            version: normalize_version(version),
         };
         match self.load_version(&key).await {
-            Ok(value) => Ok(Some(value.value)),
+            Ok(entry) => Ok(Some(entry)),
             Err(MetadataError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -249,13 +294,15 @@ impl ProviderMetadataService {
         let archive = ArchiveName::parse(provider_type, filename)
             .map_err(|_| MetadataError::InvalidAddress("archive filename".into()))?;
         Ok(self
-            .get_version(hostname, namespace, provider_type, &archive.version)
+            .get_version_entry(hostname, namespace, provider_type, &archive.version)
             .await?
-            .and_then(|metadata| {
-                metadata
+            .and_then(|entry| {
+                entry
+                    .value
                     .platforms
-                    .into_iter()
+                    .iter()
                     .find(|item| item.filename == filename)
+                    .cloned()
             }))
     }
 
@@ -280,8 +327,13 @@ impl ProviderMetadataService {
             let lock = lock_for(&self.index_locks, key.clone());
             let _guard = lock.mutex.lock().await;
             if let Err(error) = self.refresh_index_unlocked(&key).await {
+                if should_backoff(&error) {
+                    self.record_index_failure(&key);
+                }
                 failures += 1;
                 tracing::warn!(error = %error, hostname = %key.hostname, "provider metadata sync failed");
+            } else {
+                self.clear_index_failure(&key);
             }
         }
         if failures == 0 {
@@ -314,19 +366,48 @@ impl ProviderMetadataService {
         })
     }
 
-    async fn load_index(
-        &self,
-        key: &ProviderKey,
-    ) -> Result<CacheEntry<Vec<RegistryVersion>>, MetadataError> {
+    fn index_refresh_allowed(&self, key: &ProviderKey) -> bool {
+        refresh_allowed(&self.index_failures, key, self.refresh_backoff)
+    }
+
+    fn version_refresh_allowed(&self, key: &VersionKey) -> bool {
+        refresh_allowed(&self.version_failures, key, self.refresh_backoff)
+    }
+
+    fn missing_version_refresh_allowed(&self, key: &ProviderKey) -> bool {
+        refresh_allowed(&self.index_miss_refreshes, key, self.refresh_backoff)
+    }
+
+    fn record_index_failure(&self, key: &ProviderKey) {
+        record_refresh_failure(&self.index_failures, key, self.refresh_backoff);
+    }
+
+    fn record_version_failure(&self, key: &VersionKey) {
+        record_refresh_failure(&self.version_failures, key, self.refresh_backoff);
+    }
+
+    fn record_missing_version_refresh(&self, key: &ProviderKey) {
+        record_refresh_failure(&self.index_miss_refreshes, key, self.refresh_backoff);
+    }
+
+    fn clear_index_failure(&self, key: &ProviderKey) {
+        self.index_failures.write().remove(key);
+    }
+
+    fn clear_version_failure(&self, key: &VersionKey) {
+        self.version_failures.write().remove(key);
+    }
+
+    async fn load_index(&self, key: &ProviderKey) -> Result<IndexEntry, MetadataError> {
         if let Some(entry) = self.indices.read().get(key).cloned()
-            && entry.fresh(self.freshness)
+            && entry.fresh(self.freshness, self.refresh_backoff)
         {
             return Ok(entry);
         }
         let lock = lock_for(&self.index_locks, key.clone());
         let _guard = lock.mutex.lock().await;
         if let Some(entry) = self.indices.read().get(key).cloned()
-            && entry.fresh(self.freshness)
+            && entry.fresh(self.freshness, self.refresh_backoff)
         {
             return Ok(entry);
         }
@@ -334,57 +415,67 @@ impl ProviderMetadataService {
             && let Some(entry) =
                 read_json::<CacheEntry<Vec<RegistryVersion>>>(&self.index_path(key)).await?
         {
-            self.indices.write().insert(key.clone(), entry);
+            if validate_registry_versions(&entry.value).is_ok() {
+                self.indices.write().insert(key.clone(), Arc::new(entry));
+            } else {
+                tracing::warn!(
+                    path = %self.index_path(key).display(),
+                    "ignoring invalid persisted provider index"
+                );
+            }
         }
         if let Some(entry) = self.indices.read().get(key).cloned()
-            && entry.fresh(self.freshness)
+            && entry.fresh(self.freshness, self.refresh_backoff)
         {
             return Ok(entry);
         }
+        let cached = self.indices.read().get(key).cloned();
+        if !self.index_refresh_allowed(key) {
+            return cached.ok_or(MetadataError::RefreshBackoff);
+        }
         match self.refresh_index_unlocked(key).await {
-            Ok(entry) => Ok(entry),
-            Err(error) => self.indices.read().get(key).cloned().ok_or(error),
+            Ok(entry) => {
+                self.clear_index_failure(key);
+                Ok(entry)
+            }
+            Err(error) => {
+                if should_backoff(&error) {
+                    self.record_index_failure(key);
+                }
+                cached
+                    .or_else(|| self.indices.read().get(key).cloned())
+                    .ok_or(error)
+            }
         }
     }
 
-    async fn refresh_index_unlocked(
-        &self,
-        key: &ProviderKey,
-    ) -> Result<CacheEntry<Vec<RegistryVersion>>, MetadataError> {
+    async fn refresh_index_unlocked(&self, key: &ProviderKey) -> Result<IndexEntry, MetadataError> {
         let versions = self
             .registry
             .versions(&key.hostname, &key.namespace, &key.provider_type)
             .await
             .map_err(map_registry)?;
-        for version in &versions {
-            validate_component(version.version.trim_start_matches('v'), "version")?;
-            for platform in &version.platforms {
-                validate_platform_component(&platform.os, "operating system")?;
-                validate_platform_component(&platform.arch, "architecture")?;
-            }
-        }
-        let entry = CacheEntry {
+        validate_registry_versions(&versions)?;
+        let entry = Arc::new(CacheEntry {
             fetched_at: now_epoch(),
+            complete: true,
             value: versions,
-        };
-        write_json_atomic(&self.index_path(key), &entry).await?;
-        self.indices.write().insert(key.clone(), entry.clone());
+        });
+        write_json_atomic(&self.index_path(key), &*entry).await?;
+        self.indices.write().insert(key.clone(), Arc::clone(&entry));
         Ok(entry)
     }
 
-    async fn load_version(
-        &self,
-        key: &VersionKey,
-    ) -> Result<CacheEntry<VersionMetadata>, MetadataError> {
+    async fn load_version(&self, key: &VersionKey) -> Result<VersionEntry, MetadataError> {
         if let Some(entry) = self.versions.read().get(key).cloned()
-            && entry.fresh(self.freshness)
+            && entry.fresh(self.freshness, self.refresh_backoff)
         {
             return Ok(entry);
         }
         let lock = lock_for(&self.version_locks, key.clone());
         let _guard = lock.mutex.lock().await;
         if let Some(entry) = self.versions.read().get(key).cloned()
-            && entry.fresh(self.freshness)
+            && entry.fresh(self.freshness, self.refresh_backoff)
         {
             return Ok(entry);
         }
@@ -392,52 +483,161 @@ impl ProviderMetadataService {
             && let Some(entry) =
                 read_json::<CacheEntry<VersionMetadata>>(&self.version_path(key)).await?
         {
-            self.versions.write().insert(key.clone(), entry);
+            if validate_version_metadata(key, &entry.value).is_ok() {
+                self.versions.write().insert(key.clone(), Arc::new(entry));
+            } else {
+                tracing::warn!(
+                    path = %self.version_path(key).display(),
+                    "ignoring invalid persisted provider version metadata"
+                );
+            }
         }
         if let Some(entry) = self.versions.read().get(key).cloned()
-            && entry.fresh(self.freshness)
+            && entry.fresh(self.freshness, self.refresh_backoff)
         {
             return Ok(entry);
         }
+        let cached = self.versions.read().get(key).cloned();
+        if !self.version_refresh_allowed(key) {
+            return cached.ok_or(MetadataError::RefreshBackoff);
+        }
         match self.refresh_version(key).await {
-            Ok(entry) => Ok(entry),
-            Err(error) => self.versions.read().get(key).cloned().ok_or(error),
+            Ok(entry) => {
+                self.clear_version_failure(key);
+                Ok(entry)
+            }
+            Err(error) => {
+                if should_backoff(&error) {
+                    self.record_version_failure(key);
+                }
+                cached
+                    .or_else(|| self.versions.read().get(key).cloned())
+                    .ok_or(error)
+            }
         }
     }
 
-    async fn refresh_version(
-        &self,
-        key: &VersionKey,
-    ) -> Result<CacheEntry<VersionMetadata>, MetadataError> {
-        let index = self.load_index(&key.provider).await?;
+    async fn refresh_version(&self, key: &VersionKey) -> Result<VersionEntry, MetadataError> {
+        let mut index = self.load_index(&key.provider).await?;
+        if !index
+            .value
+            .iter()
+            .any(|item| normalize_version(&item.version) == key.version)
+            && self.missing_version_refresh_allowed(&key.provider)
+            && self.index_refresh_allowed(&key.provider)
+        {
+            let lock = lock_for(&self.index_locks, key.provider.clone());
+            let _guard = lock.mutex.lock().await;
+            index = self
+                .indices
+                .read()
+                .get(&key.provider)
+                .cloned()
+                .unwrap_or(index);
+            if !index
+                .value
+                .iter()
+                .any(|item| normalize_version(&item.version) == key.version)
+                && self.missing_version_refresh_allowed(&key.provider)
+                && self.index_refresh_allowed(&key.provider)
+            {
+                self.record_missing_version_refresh(&key.provider);
+                index = match self.refresh_index_unlocked(&key.provider).await {
+                    Ok(index) => {
+                        self.clear_index_failure(&key.provider);
+                        index
+                    }
+                    Err(error) => {
+                        if should_backoff(&error) {
+                            self.record_index_failure(&key.provider);
+                        }
+                        return Err(error);
+                    }
+                };
+            }
+        }
         let summary = index
             .value
-            .into_iter()
-            .find(|item| item.version.trim_start_matches('v') == key.version)
+            .iter()
+            .find(|item| normalize_version(&item.version) == key.version)
+            .cloned()
             .ok_or(MetadataError::NotFound)?;
-        let platforms = stream::iter(summary.platforms.into_iter().map(|platform| {
-            let registry = self.registry.clone();
-            let key = key.clone();
-            async move {
-                let package = registry
-                    .package(
-                        &key.provider.hostname,
-                        &key.provider.namespace,
-                        &key.provider.provider_type,
-                        &key.version,
-                        &platform,
-                    )
-                    .await
-                    .map_err(map_registry)?;
-                validate_package(&key, &platform, &package)?;
-                Ok::<_, MetadataError>(package)
+        let cached = self.versions.read().get(key).cloned();
+        let valid_platforms = summary
+            .platforms
+            .iter()
+            .map(|platform| (platform.os.as_str(), platform.arch.as_str()))
+            .collect::<HashSet<_>>();
+        let mut package_results =
+            stream::iter(summary.platforms.clone().into_iter().enumerate().map(
+                |(index, platform)| {
+                    let registry = self.registry.clone();
+                    let key = key.clone();
+                    async move {
+                        let result = registry
+                            .package(
+                                &key.provider.hostname,
+                                &key.provider.namespace,
+                                &key.provider.provider_type,
+                                &key.version,
+                                &platform,
+                            )
+                            .await
+                            .map_err(map_registry)
+                            .and_then(|package| {
+                                validate_package(&key, &platform, &package).map(|()| package)
+                            });
+                        (index, result)
+                    }
+                },
+            ))
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        package_results.sort_by_key(|(index, _)| *index);
+        let mut refreshed = HashMap::new();
+        let mut first_error = None;
+        for (_, result) in package_results {
+            match result {
+                Ok(package) => {
+                    refreshed.insert((package.os.clone(), package.arch.clone()), package);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        hostname = %key.provider.hostname,
+                        namespace = %key.provider.namespace,
+                        provider_type = %key.provider.provider_type,
+                        version = %key.version,
+                        "provider platform metadata fetch failed"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
-        }))
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        }
+        let mut platforms = Vec::with_capacity(summary.platforms.len());
+        for platform in &summary.platforms {
+            let platform_key = (platform.os.clone(), platform.arch.clone());
+            if let Some(package) = refreshed.remove(&platform_key) {
+                platforms.push(package);
+            } else if let Some(cached_platform) = cached.as_ref().and_then(|entry| {
+                entry.value.platforms.iter().find(|item| {
+                    item.os == platform.os
+                        && item.arch == platform.arch
+                        && valid_platforms.contains(&(item.os.as_str(), item.arch.as_str()))
+                })
+            }) {
+                platforms.push(cached_platform.clone());
+            }
+        }
+        let complete = first_error.is_none();
+        if platforms.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
         let value = VersionMetadata {
             hostname: key.provider.hostname.clone(),
             namespace: key.provider.namespace.clone(),
@@ -445,12 +645,15 @@ impl ProviderMetadataService {
             version: key.version.clone(),
             platforms,
         };
-        let entry = CacheEntry {
+        let entry = Arc::new(CacheEntry {
             fetched_at: now_epoch(),
+            complete,
             value,
-        };
-        write_json_atomic(&self.version_path(key), &entry).await?;
-        self.versions.write().insert(key.clone(), entry.clone());
+        });
+        write_json_atomic(&self.version_path(key), &*entry).await?;
+        self.versions
+            .write()
+            .insert(key.clone(), Arc::clone(&entry));
         Ok(entry)
     }
 
@@ -472,7 +675,7 @@ impl ProviderMetadataService {
 fn discover_indices(
     root: &Path,
     allowed_registries: &HashSet<String>,
-) -> Result<HashMap<ProviderKey, CacheEntry<Vec<RegistryVersion>>>, MetadataError> {
+) -> Result<HashMap<ProviderKey, IndexEntry>, MetadataError> {
     let mut indices = HashMap::new();
     let hostnames = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -503,14 +706,32 @@ fn discover_indices(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                let entry = serde_json::from_slice(&bytes)?;
+                let entry = match serde_json::from_slice::<CacheEntry<Vec<RegistryVersion>>>(&bytes)
+                {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %provider_entry.path().join("index.json").display(),
+                            error = %error,
+                            "ignoring corrupt persisted provider index"
+                        );
+                        continue;
+                    }
+                };
+                if validate_registry_versions(&entry.value).is_err() {
+                    tracing::warn!(
+                        path = %provider_entry.path().join("index.json").display(),
+                        "ignoring invalid persisted provider index"
+                    );
+                    continue;
+                }
                 indices.insert(
                     ProviderKey {
                         hostname: hostname.clone(),
                         namespace: namespace.clone(),
                         provider_type,
                     },
-                    entry,
+                    Arc::new(entry),
                 );
             }
         }
@@ -550,6 +771,17 @@ fn lock_for<K: Eq + std::hash::Hash + Clone>(locks: &KeyLockMap<K>, key: K) -> M
     }
 }
 
+/// Orders versions by semver precedence; unparseable strings sort after
+/// parseable ones, in plain string order.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
+}
+
 fn validate_package(
     key: &VersionKey,
     requested: &crate::registry::RegistryPlatform,
@@ -586,6 +818,60 @@ fn validate_package(
     Ok(())
 }
 
+fn validate_registry_versions(versions: &[RegistryVersion]) -> Result<(), MetadataError> {
+    if versions.len() > 4096 {
+        return Err(MetadataError::InvalidAddress(
+            "too many provider versions".into(),
+        ));
+    }
+    for version in versions {
+        validate_version(&version.version, "version")?;
+        if version.platforms.len() > 128 {
+            return Err(MetadataError::InvalidAddress(
+                "too many provider platforms".into(),
+            ));
+        }
+        for platform in &version.platforms {
+            validate_platform_component(&platform.os, "operating system")?;
+            validate_platform_component(&platform.arch, "architecture")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_version_metadata(
+    key: &VersionKey,
+    metadata: &VersionMetadata,
+) -> Result<(), MetadataError> {
+    if metadata.hostname != key.provider.hostname
+        || metadata.namespace != key.provider.namespace
+        || metadata.provider_type != key.provider.provider_type
+    {
+        return Err(MetadataError::InvalidAddress(
+            "persisted provider metadata identity".into(),
+        ));
+    }
+    validate_version(&metadata.version, "version")?;
+    if normalize_version(&metadata.version) != key.version {
+        return Err(MetadataError::InvalidAddress(
+            "persisted provider metadata version".into(),
+        ));
+    }
+    if metadata.platforms.len() > 128 {
+        return Err(MetadataError::InvalidAddress(
+            "too many provider platforms".into(),
+        ));
+    }
+    for platform in &metadata.platforms {
+        let requested = crate::registry::RegistryPlatform {
+            os: platform.os.clone(),
+            arch: platform.arch.clone(),
+        };
+        validate_package(key, &requested, platform)?;
+    }
+    Ok(())
+}
+
 fn validate_hostname(value: &str) -> Result<(), MetadataError> {
     if value.is_empty() || value.len() > 253 || value.split('.').any(|part| !valid_component(part))
     {
@@ -595,7 +881,15 @@ fn validate_hostname(value: &str) -> Result<(), MetadataError> {
 }
 
 fn validate_component(value: &str, name: &str) -> Result<(), MetadataError> {
-    if !valid_component(value.trim_start_matches('v')) {
+    if !valid_component(value) {
+        return Err(MetadataError::InvalidAddress(name.into()));
+    }
+    Ok(())
+}
+
+fn validate_version(value: &str, name: &str) -> Result<(), MetadataError> {
+    let normalized = normalize_version(value);
+    if !valid_version(&normalized) {
         return Err(MetadataError::InvalidAddress(name.into()));
     }
     Ok(())
@@ -623,11 +917,63 @@ fn valid_component(value: &str) -> bool {
         && value != ".."
 }
 
+fn valid_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        && value != "."
+        && value != ".."
+}
+
+fn normalize_version(value: &str) -> String {
+    value.strip_prefix('v').unwrap_or(value).to_string()
+}
+
+fn refresh_allowed<K>(failures: &RwLock<HashMap<K, Instant>>, key: &K, backoff: Duration) -> bool
+where
+    K: Eq + std::hash::Hash,
+{
+    failures
+        .read()
+        .get(key)
+        .is_none_or(|retry_at| Instant::now() >= *retry_at || backoff.is_zero())
+}
+
+fn record_refresh_failure<K>(failures: &RwLock<HashMap<K, Instant>>, key: &K, backoff: Duration)
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    const MAX_FAILURES: usize = 4096;
+    let now = Instant::now();
+    let mut failures = failures.write();
+    failures.retain(|_, retry_at| *retry_at > now);
+    if failures.len() >= MAX_FAILURES
+        && let Some(oldest) = failures
+            .iter()
+            .min_by_key(|(_, retry_at)| **retry_at)
+            .map(|(key, _)| key.clone())
+    {
+        failures.remove(&oldest);
+    }
+    failures.insert(key.clone(), now + backoff);
+}
+
 fn map_registry(error: RegistryError) -> MetadataError {
     match error {
         RegistryError::NotFound => MetadataError::NotFound,
         error => MetadataError::Registry(error),
     }
+}
+
+fn should_backoff(error: &MetadataError) -> bool {
+    !matches!(
+        error,
+        MetadataError::NotFound
+            | MetadataError::InvalidAddress(_)
+            | MetadataError::RegistryNotAllowed(_)
+    )
 }
 
 fn now_epoch() -> u64 {
@@ -639,7 +985,17 @@ fn now_epoch() -> u64 {
 
 async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, MetadataError> {
     match tokio::fs::read(path).await {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "ignoring corrupt persisted provider metadata"
+                );
+                Ok(None)
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -685,4 +1041,25 @@ async fn sync_parent(parent: &Path) -> Result<(), MetadataError> {
 #[cfg(not(unix))]
 async fn sync_parent(_parent: &Path) -> Result<(), MetadataError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderKey, record_refresh_failure};
+    use parking_lot::RwLock;
+    use std::{collections::HashMap, time::Duration};
+
+    #[test]
+    fn refresh_failure_map_is_bounded() {
+        let failures = RwLock::new(HashMap::new());
+        for index in 0..5000 {
+            let key = ProviderKey {
+                hostname: format!("registry-{index}.example"),
+                namespace: "hashicorp".into(),
+                provider_type: "random".into(),
+            };
+            record_refresh_failure(&failures, &key, Duration::from_secs(30));
+        }
+        assert_eq!(failures.read().len(), 4096);
+    }
 }

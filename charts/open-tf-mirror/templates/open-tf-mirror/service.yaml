@@ -35,7 +35,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "open-tf-mirror.name" . }}-headless
+  name: {{ include "open-tf-mirror.headlessName" . }}
   namespace: {{ include "open-tf-mirror.namespace" . }}
   {{- if .Values.commonAnnotations }}
   annotations:
