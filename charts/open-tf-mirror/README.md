@@ -45,6 +45,10 @@ The Service's `ports` values remain the client-facing ports. The pod has a
 30-second termination grace period to allow the server's 15-second connection
 drain to complete.
 
+`openTfMirror.env` entries are appended after `TF_PLUGIN_MIRROR_DIR`. Use them
+for example to set `HTTPS_PROXY`/`NO_PROXY` together with
+`--outbound-mode=trusted-proxy` in `openTfMirror.args`.
+
 `global.imagePullSecrets` accepts either secret names or Kubernetes-style
 `{name: ...}` entries. The chart normalizes both forms to
 `LocalObjectReference` objects in the Pod spec.
@@ -71,6 +75,8 @@ backward-compatible default of `minAvailable: 1`; numeric zero is preserved.
 | `openTfMirror.tls.domainName` | `""` | Legacy compatibility value; certificate issuance is not implemented. |
 | `openTfMirror.tls.secretName` | `""` | Existing TLS secret to mount. |
 | `openTfMirror.upstreamCA.secretName` | `""` | Optional Secret containing `ca.crt` for upstream TLS. |
+| `openTfMirror.env` | `[]` | Extra container environment variables. |
+| `openTfMirror.startupProbe.timeoutSeconds` | `5` | `/readyz` writes and fsyncs a probe file on the PVC. |
 | `openTfMirror.resources` | `{}` | Container requests and limits. |
 | `openTfMirror.pvc.size` | `1Gi` | PVC template size. |
 | `openTfMirror.pvc.storageClass` | `""` | PVC storage class. |

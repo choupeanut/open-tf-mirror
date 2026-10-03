@@ -11,7 +11,11 @@ Create an ApplicationSet entry that sources the immutable release tag from
 `charts/open-tf-mirror`. Keep the existing cluster generator and namespace
 ownership model. Pin `targetRevision` to a release tag rather than `main`.
 
-For this reliability revision, use chart/image `0.2.1`. The chart keeps the
+For this revision, use chart/image `0.3.0` (tag `v0.3.0`). Before upgrading
+from 0.2.x, remove any `--enable-module-mirror` / `--module-registry-base`
+arguments (the module mirror was removed). Custom `openTfMirror.env` entries now
+render correctly. If many Terraform runners connect at the same time, raise
+`--conn-burst`: it now limits plain HTTP connections as well. The chart keeps the
 existing client-facing HTTPS Service port at 443 while passing the Service port
 to `--https-redirect-port`; do not hard-code the container port 8443 in the
 redirect setting. Preserve existing `env`/`envFrom` entries for proxy settings.

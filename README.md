@@ -1,48 +1,60 @@
 # open-tf-mirror
 
-`open-tf-mirror` is a persistent, on-demand Terraform/OpenTofu provider network
-mirror. It is intended as a compatible replacement for the HermitCrab usage in
-Pricer's infrastructure workflows while fixing custom TLS certificate rotation.
+`open-tf-mirror` is a persistent, on-demand Terraform/OpenTofu provider
+[network mirror](https://developer.hashicorp.com/terraform/internals/provider-network-mirror-protocol)
+written in Rust. It replaces the [HermitCrab](https://github.com/seal-io/hermitcrab)
+deployment used in Pricer's infrastructure workflows. It keeps the same URL shape
+and Helm values, and fixes the HermitCrab problems listed below.
 
-## Provider behavior
+## Why not HermitCrab
 
-- Implements `index.json`, version metadata, and archive download endpoints
-  below `/v1/providers/`.
-- Fetches provider metadata from allowed origin registries and persists it for
-  30 minutes by default. Partial platform results are retained and retried
-  after 30 seconds; a failed refresh never replaces valid data with an empty
-  response.
-- Refreshes a stale registry index once when a requested provider version is
-  missing, with a 30-second per-provider backoff.
-- Serves stale persisted metadata if an origin is temporarily unavailable.
-- Uses Terraform registry service discovery (`/.well-known/terraform.json`)
-  and preserves service path prefixes such as `/registry/`.
-- Checks an optional bundled filesystem mirror, then the PVC cache, before
-  downloading an archive.
-- Streams archive downloads, verifies the registry SHA-256 checksum, and
-  publishes them atomically.
-- Deduplicates concurrent metadata refreshes and archive downloads.
-- Restricts provider origins to `registry.terraform.io` by default and rejects
-  non-HTTPS or non-public archive targets in direct outbound mode.
+| HermitCrab case | open-tf-mirror behaviour |
+| --- | --- |
+| [PR #28](https://github.com/seal-io/hermitcrab/pull/28): custom TLS certificates are never reloaded | Certificate and key are re-read at most every 5 s on new handshakes. A broken or expired replacement keeps the last valid pair, and the `notAfter` boundary is inclusive (RFC 5280). |
+| [#27](https://github.com/seal-io/hermitcrab/issues/27): proxies strip `Range`, so a `200 OK` is treated as an error | Archives are always fetched as a full `200` stream, then SHA-256-verified before they are published. |
+| [#26](https://github.com/seal-io/hermitcrab/issues/26): newly published versions are missing | A request for a version that is not in the cached index forces one index refresh, with a 30 s per-provider backoff. |
+| [#14](https://github.com/seal-io/hermitcrab/issues/14): cannot be used behind a proxy | `--outbound-mode=trusted-proxy` honours `HTTP(S)_PROXY`/`NO_PROXY`, and `--upstream-ca-file` trusts a corporate CA. |
+| [#15](https://github.com/seal-io/hermitcrab/issues/15): Teleport and other third-party registries return 400/404 | Terraform service discovery (`providers.v1`) is followed, path prefixes such as `/registry/` are kept, and both archive naming styles are parsed. |
+| [#24](https://github.com/seal-io/hermitcrab/issues/24): provider types containing `-` (`google-beta`) | Archive names are parsed from the right using the known provider type and validated as semver. |
+| [#22](https://github.com/seal-io/hermitcrab/issues/22): how to disable TLS | `--enable-tls=false` (the Helm default) serves plain HTTP behind an ingress. |
 
-The optional module proxy is not part of the production compatibility contract
-and is disabled by default. Enable it explicitly with
-`--enable-module-mirror=true` only after reviewing its separate trust model.
+## Provider behaviour
+
+- Implements the network mirror protocol below `/v1/providers/`: `index.json`,
+  `{version}.json` and archive downloads.
+- Persists provider metadata for 30 minutes by default. A partial platform
+  result is kept and retried after 30 seconds. A failed refresh never replaces
+  valid data, and stale metadata is served while an origin is down.
+- Archive lookup order is the optional bundled filesystem mirror, then the PVC
+  cache, then upstream. Each file's checksum is verified once and remembered by
+  file identity (device, inode, size, mtime). A file that is replaced or
+  corrupted is hashed again.
+- Upstream downloads stream to a temp file and are size-capped, checksum-verified,
+  fsynced and atomically renamed into place. Each archive is downloaded once
+  even under concurrent requests. A download runs to completion even if the
+  requesting client disconnects.
+- Responses carry `Content-Length`. Archives are streamed from disk.
+- Only `registry.terraform.io` is allowed by default; add OpenTofu with
+  `--allowed-registries=registry.terraform.io,registry.opentofu.org`.
+- Leftover `.tmp` files from an interrupted run are removed at startup.
 
 ## Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/v1/providers/:hostname/:namespace/:type/index.json` | List versions. |
-| `GET` | `/v1/providers/:hostname/:namespace/:type/:version.json` | List platform archives. |
+| `GET` | `/v1/providers/:hostname/:namespace/:type/index.json` | List versions (normalized, de-duplicated). |
+| `GET` | `/v1/providers/:hostname/:namespace/:type/:version.json` | List platform archives with `zh:` hashes. |
 | `GET` | `/v1/providers/:hostname/:namespace/:type/download/:archive` | Serve or populate an archive. |
-| `PUT` | `/v1/providers/sync` | Refresh known provider indices. |
+| `PUT` | `/v1/providers/sync` | Refresh every known provider index. |
 | `GET` | `/readyz` | Confirm the cache directory is writable. |
 | `GET` | `/livez` | Confirm the process is alive. |
 
-## Configuration
+Provider endpoints are rate-limited by a token bucket (`--conn-qps`,
+`--conn-burst`); excess requests get `429` with `Retry-After: 1`.
+`PUT /v1/providers/sync` has no application-level authentication. Restrict it
+with a NetworkPolicy or ingress ACL.
 
-The current cert-manager deployment supplies a certificate and private key:
+## Configuration
 
 ```shell
 open-tf-mirror \
@@ -53,8 +65,6 @@ open-tf-mirror \
   --conn-burst=500
 ```
 
-The key flags and environment variables are:
-
 | Flag | Environment | Default |
 | --- | --- | --- |
 | `--bind-address` | `SERVER_BIND_ADDRESS` | `0.0.0.0` |
@@ -62,72 +72,110 @@ The key flags and environment variables are:
 | `--https-port` | `SERVER_HTTPS_PORT` | `8443` |
 | `--https-redirect-port` | `SERVER_HTTPS_REDIRECT_PORT` | HTTPS listener port |
 | `--enable-tls` | `SERVER_ENABLE_TLS` | `true` |
+| `--tls-cert-file` / `--tls-private-key-file` | `SERVER_TLS_CERT_FILE` / `SERVER_TLS_PRIVATE_KEY_FILE` | unset (required with TLS) |
 | `--data-source-dir` | `SERVER_DATA_SOURCE_DIR` | `/var/run/open-tf-mirror` |
 | `--allowed-registries` | `SERVER_ALLOWED_REGISTRIES` | `registry.terraform.io` |
 | `--metadata-ttl-seconds` | `SERVER_METADATA_TTL_SECONDS` | `1800` (minimum `30`) |
 | `--outbound-mode` | `SERVER_OUTBOUND_MODE` | `direct` |
 | `--upstream-ca-file` | `SERVER_UPSTREAM_CA_FILE` | unset |
-| `--enable-module-mirror` | `SERVER_ENABLE_MODULE_MIRROR` | `false` |
+| `--conn-qps` / `--conn-burst` | — | `100` / `200` |
+| `--log-debug`, `--log-verbosity` | `RUST_LOG` overrides both | `info` |
+| — | `TF_PLUGIN_MIRROR_DIR` | unset (optional bundled mirror) |
 
-Custom certificate files are re-read at most once every five seconds. A failed
-reload keeps the last valid matching certificate and private key. With TLS
-enabled, HTTP health probes remain available and other HTTP requests redirect to
-HTTPS. The redirect port defaults to the HTTPS listener for direct execution;
-the Helm chart sets it to the Service HTTPS port (443 by default).
+### Listeners
 
-`direct` mode ignores proxy environment variables, pins DNS results after
-rejecting private addresses, and revalidates every HTTPS redirect. Set
-`trusted-proxy` only when `HTTP_PROXY`/`HTTPS_PROXY` (or lowercase equivalents)
-are configured; reqwest then applies `NO_PROXY` matching and the proxy controls
-egress isolation. A PEM CA bundle may be supplied with `--upstream-ca-file`;
-malformed bundles fail startup and TLS verification cannot be disabled.
+HTTP and HTTPS share one connection loop with these settings:
 
-Persistent data uses this layout:
+- At most `--conn-burst` concurrent connections per listener.
+- A 60 s HTTP/1 header-read timeout, plus HTTP/2 keep-alive pings every 30 s
+  with a 60 s timeout.
+- A 10 s TLS handshake timeout.
+- Accept errors such as `EMFILE` are retried after 100 ms instead of
+  terminating the process.
+
+On `SIGTERM`, both listeners stop accepting and ask live connections to close
+gracefully (HTTP/1 `Connection: close`, HTTP/2 `GOAWAY`). Connections still open
+after 15 s are cancelled.
+
+With TLS enabled, `/readyz` and `/livez` stay available on HTTP, and other
+`GET`/`HEAD` requests redirect to HTTPS on `--https-redirect-port`.
+
+### Outbound policy
+
+- **`direct`** (default): proxy variables are ignored. The upstream TLS client
+  is shared and pooled. A custom DNS resolver rejects any name that resolves to
+  a private, loopback, link-local, CGNAT or documentation address (including
+  IPv4-mapped, NAT64 and 6to4 forms). The client connects only to the addresses
+  that resolver vetted, so DNS rebinding cannot bypass the check. IP-literal
+  URLs are checked the same way. Every redirect hop (max 5) must be HTTPS and is
+  re-validated.
+- **`trusted-proxy`**: requires `HTTP_PROXY`/`HTTPS_PROXY` (or lowercase) and
+  applies `NO_PROXY`. Egress isolation becomes the proxy's job.
+- `--upstream-ca-file` adds a PEM CA bundle. A malformed bundle fails startup,
+  and TLS verification cannot be disabled.
+
+### Persistent layout
 
 ```text
 <data-source-dir>/
-├── metadata/<hostname>/<namespace>/<provider>/
-└── providers/<hostname>/<namespace>/<provider>/
+├── metadata/<hostname>/<namespace>/<provider>/{index.json,<version>.json}
+└── providers/<hostname>/<namespace>/<provider>/<archive>.zip
 ```
 
 ## Helm
 
-The chart lives at `charts/open-tf-mirror` and can be consumed directly from an
-immutable Git tag. The runtime and provider-copy init container use UID/GID
-`10001`; the server has a read-only root filesystem and writes only to its PVC.
-TLS is disabled by default. Enabling it requires an existing Secret through
-`openTfMirror.tls.secretName`; the chart does not issue ACME certificates. An
-optional `openTfMirror.upstreamCA.secretName` mounts the Secret key `ca.crt`
-and configures `--upstream-ca-file` for private registry or archive CAs.
+The chart lives at `charts/open-tf-mirror` and can be consumed from an immutable
+Git tag. It has these defaults:
 
-See [the chart README](charts/open-tf-mirror/README.md) for values and rendered
-resource names.
+- The server and provider-copy init container run as UID/GID `10001`.
+- The server's root filesystem is read-only, and it writes only to its PVC.
+- TLS is off. Enabling it requires an existing Secret in
+  `openTfMirror.tls.secretName`.
+- `openTfMirror.upstreamCA.secretName` mounts `ca.crt` for private registry
+  CAs.
+- Extra variables go in `openTfMirror.env`, for example `HTTPS_PROXY` for
+  `trusted-proxy` mode.
+
+See [the chart README](charts/open-tf-mirror/README.md).
+
+Each StatefulSet replica has its own PVC; caches are not shared across pods.
+
+## Operational notes
+
+- `--conn-burst` caps concurrent connections on **each** listener, including
+  plain HTTP. Extra connections wait in the kernel listen backlog. Raise it
+  for large CI fleets.
+- A plain-HTTP client must send its first bytes within 10 s. Idle HTTP/1
+  keep-alive connections close after 60 s. An idle HTTP/2 connection that keeps
+  answering pings stays open.
+- A cache hit does not re-hash an unchanged file. Silent on-disk corruption is
+  only detected when the file's identity changes or the process restarts.
+  Terraform still verifies the `zh:` hash it was given.
+- Startup deletes `.*.tmp` under `providers/` and `metadata/`. Do not point two
+  processes at the same data directory.
 
 ## Verification
 
-Run all static checks, RustSec audit, Helm renders, and the container build:
-
 ```shell
-./scripts/verify.sh
+./scripts/verify.sh            # fmt, clippy, tests, cargo-audit, helm, kubeconform, docker build
+RUN_E2E=1 ./scripts/verify.sh  # plus a real Terraform online -> offline cache smoke test
 ```
 
-Run the real Terraform TLS/cache smoke test as well:
+The E2E run performs one online `terraform init` through the mirror. It then
+restarts the mirror on a network-isolated Docker network, deletes Terraform's
+plugin cache, and proves a second init succeeds from the PVC cache alone. Last,
+it shows that a deleted archive cannot be silently refetched. It needs Docker,
+Terraform, `openssl`, `curl`, `jq` and `socat`.
 
-```shell
-RUN_E2E=1 ./scripts/verify.sh
-```
+## Documentation
 
-The smoke test performs one online `terraform init`, restarts the mirror on a
-network-isolated Docker network, deletes Terraform's local plugin cache, and
-proves a second init succeeds without allowing the mirror to reach the upstream
-registry. `RUN_E2E=1` therefore requires Docker and the image built by the
-verification script, plus `openssl`, `curl`, `jq`, `socat`, and Terraform on
-the host.
+- [Changelog](CHANGELOG.md)
+- [0.3.0 architecture review and plan](docs/reviews/2026-10-03-architecture-review.md)
+- [HermitCrab upstream comparison](docs/reviews/2026-09-06-hermitcrab-upstream-comparison.md)
+- Consumer migration runbooks:
+  [`cloud-infra-argocd-apps`](docs/migration/cloud-infra-argocd-apps.md),
+  [`cloud-infra-terragrunt-terraform`](docs/migration/cloud-infra-terragrunt-terraform.md)
 
-## Consumer migration
+## License
 
-The consumer repositories have **not** been changed by this repository. The
-reviewed migration runbooks are:
-
-- [`cloud-infra-argocd-apps`](docs/migration/cloud-infra-argocd-apps.md)
-- [`cloud-infra-terragrunt-terraform`](docs/migration/cloud-infra-terragrunt-terraform.md)
+Apache-2.0, see [LICENSE](LICENSE).

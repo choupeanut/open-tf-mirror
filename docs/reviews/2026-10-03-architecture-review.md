@@ -57,3 +57,35 @@ kubeconform、Docker build，以及 `RUN_E2E=1` 的 Terraform online → offline
 - Prometheus metrics、跨 replica 共享快取、PVC 自動淘汰、ACME：都是新功能，不在可靠性修正範圍。
 - 以 `x509-parser` 取代自寫 DER validity parser：現有 parser 範圍小且有測試，新依賴的成本較高。
 - `PUT /v1/providers/sync` 驗證：仍以 NetworkPolicy 限制，維持 HermitCrab 相容行為。
+
+## 實作與驗收結果
+
+實作由 4 個 Sonnet 5.5 sub-agent 依上表平行完成（各自 worktree），再由 Opus 5.5 agent 審查與驗收。
+
+| 項目 | Commit | 結果 |
+| --- | --- | --- |
+| B7、B10 | `3b0ac99` | module mirror 移除；啟動時清理 `.tmp`（失敗只記 warning） |
+| B3 | `e2b7cd9` | 單一 pooled client + `PublicOnlyResolver`；IP literal、NAT64、6to4 檢查 |
+| B1、B5 | `34dad47` | HTTP/HTTPS 共用 `serve_listener`；accept 錯誤退避 100 ms |
+| B4、B6、B12 | `a50e558` | 以檔案 identity 記住驗證結果；detached download；`Content-Length` |
+| B2 | `1a565c2` | chart env 修正；startup probe timeout 5 s；CI render 斷言 |
+| B8、B9、B11 | `68c53dc` | `Arc` 快取；`index.json` 版本正規化；TLS `notAfter` inclusive 與重試節流 |
+
+### Opus 驗收發現
+
+| 嚴重度 | 問題 | 處理 |
+| --- | --- | --- |
+| High（本次回歸） | hyper-util `auto::Builder` 判斷 HTTP 版本時的初次讀取沒有 timeout；統一 serve loop 後純 HTTP 也有連線上限，200 條不送資料的連線即可鎖住 listener | `de16044`：交給 hyper 前，在 handshake timeout（10 s）內 `peek` 出協定；加回歸測試 |
+| Low | CI 中段的 `! grep` 不會觸發 errexit，等於沒有斷言 | 改為 `if grep ...; then exit 1; fi`，並在本機逐步執行全部通過 |
+| Low | 啟動清理 `.tmp` 失敗會阻止啟動 | 改為 warning |
+| Low | detached download 失敗而所有 client 都已斷線時沒有 log | 在 task 內記錄 |
+| Low（既有） | TLS 握手完成後靜默、閒置 HTTP/2 連線會持續佔用 permit | 記錄於 README Operational notes |
+
+### 驗收紀錄
+
+- `cargo fmt --check`、`cargo clippy -D warnings`（stable 與 MSRV 1.88）：通過
+- `cargo test --all-targets`：92 passed / 0 failed
+- `cargo audit`：0 vulnerabilities
+- CI helm job 逐步本機執行、kubeconform `-strict`：通過
+- `./scripts/verify.sh`（含 Docker build）與 `RUN_E2E=1`：通過。online `terraform init` → 隔離網路下 cache hit → 刪除 archive 後預期 502 且沒有殘留 `.tmp`
+- 手動 smoke：`hashicorp/random` 3.6.2 archive 的 `Content-Length` 正確，sha256 與 `zh:` hash 相符；第二次請求為 cache hit；SIGTERM 約 0.01 s 正常結束
