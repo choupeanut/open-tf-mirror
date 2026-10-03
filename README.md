@@ -78,7 +78,8 @@ open-tf-mirror \
 | `--metadata-ttl-seconds` | `SERVER_METADATA_TTL_SECONDS` | `1800` (minimum `30`) |
 | `--outbound-mode` | `SERVER_OUTBOUND_MODE` | `direct` |
 | `--upstream-ca-file` | `SERVER_UPSTREAM_CA_FILE` | unset |
-| `--conn-qps` / `--conn-burst` | — | `100` / `200` |
+| `--conn-qps` / `--conn-burst` | — | `100` / `200` (provider request rate limit) |
+| `--max-connections` | `SERVER_MAX_CONNECTIONS` | `4096` (concurrent connections per listener) |
 | `--log-debug`, `--log-verbosity` | `RUST_LOG` overrides both | `info` |
 | — | `TF_PLUGIN_MIRROR_DIR` | unset (optional bundled mirror) |
 
@@ -86,7 +87,9 @@ open-tf-mirror \
 
 HTTP and HTTPS share one connection loop with these settings:
 
-- At most `--conn-burst` concurrent connections per listener.
+- At most `--max-connections` concurrent connections per listener. This is
+  separate from the `--conn-qps`/`--conn-burst` request rate limit, so idle
+  keep-alive connections cannot starve health probes.
 - A 60 s HTTP/1 header-read timeout, plus HTTP/2 keep-alive pings every 30 s
   with a 60 s timeout.
 - A 10 s TLS handshake timeout.
@@ -142,9 +145,10 @@ Each StatefulSet replica has its own PVC; caches are not shared across pods.
 
 ## Operational notes
 
-- `--conn-burst` caps concurrent connections on **each** listener, including
-  plain HTTP. Extra connections wait in the kernel listen backlog. Raise it
-  for large CI fleets.
+- `--max-connections` caps concurrent connections on **each** listener.
+  Connections over the cap wait in the kernel listen backlog. The default of
+  4096 needs a matching open-file limit; container runtimes normally allow
+  far more.
 - A plain-HTTP client must send its first bytes within 10 s. Idle HTTP/1
   keep-alive connections close after 60 s. An idle HTTP/2 connection that keeps
   answering pings stays open.

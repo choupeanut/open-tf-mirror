@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1 — 2026-10-04
+
+Follow-up from the PR #1 review.
+
+### Fixed
+
+- `--conn-burst` no longer doubles as the connection cap. In 0.3.0 it also
+  limited plain-HTTP connections (default 200). Plain HTTP is the chart default,
+  where Terraform clients, ingress keep-alive pools and kubelet probes share
+  one listener, so idle keep-alive connections could park `/livez` in the
+  listen backlog and get the pod restarted under load. Connections are now
+  capped by the new `--max-connections` (`SERVER_MAX_CONNECTIONS`, default
+  4096 per listener). `--conn-qps`/`--conn-burst` go back to being only the
+  HermitCrab-compatible request rate limit.
+
 ## 0.3.0 — 2026-10-03
 
 Reliability and performance release driven by the

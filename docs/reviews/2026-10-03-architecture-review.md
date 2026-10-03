@@ -89,3 +89,14 @@ kubeconform、Docker build，以及 `RUN_E2E=1` 的 Terraform online → offline
 - CI helm job 逐步本機執行、kubeconform `-strict`：通過
 - `./scripts/verify.sh`（含 Docker build）與 `RUN_E2E=1`：通過。online `terraform init` → 隔離網路下 cache hit → 刪除 archive 後預期 502 且沒有殘留 `.tmp`
 - 手動 smoke：`hashicorp/random` 3.6.2 archive 的 `Content-Length` 正確，sha256 與 `zh:` hash 相符；第二次請求為 cache hit；SIGTERM 約 0.01 s 正常結束
+
+## PR #1 合併前複審（2026-10-04）
+
+複審整個 PR（`main..codex/project-hardening`，39 個檔案）。0.3.0 的內容已併入 PR 分支；
+另外重跑測試 5 次，沒有 flaky test。
+
+| 嚴重度 | 問題 | 處理 |
+| --- | --- | --- |
+| P1（0.3.0 回歸） | 統一 serve loop 後，`--conn-burst`（預設 200，HermitCrab 的請求速率 burst）同時成為純 HTTP 的連線上限。chart 預設走純 HTTP，Terraform client、ingress keep-alive pool 與 kubelet probe 共用一個 listener；200 條閒置 keep-alive 連線即可讓 `/livez` 卡在 backlog，pod 在負載下被重啟 | 新增 `--max-connections`（`SERVER_MAX_CONNECTIONS`，預設每個 listener 4096），`--conn-burst` 恢復為純速率限制；實測 `--conn-burst=2` 加 10 條閒置連線時 probe 立即回 200 |
+
+其餘檔案（chart template、schema、PDB、CI、verify.sh、storage memo、metadata、TLS）未發現需修正的問題。

@@ -4,7 +4,7 @@ This runbook describes the consumer-side change from HermitCrab to the
 `open-tf-mirror` network mirror. It does not edit the Terraform consumer
 repository.
 
-The consumer rollout target for this revision is `open-tf-mirror` 0.3.0. Keep
+The consumer rollout target for this revision is `open-tf-mirror` 0.3.1. Keep
 the Terraform mirror URL on the deployed HTTPS Service and retain the existing
 HermitCrab configuration as the rollback path until an online and a restarted,
 network-isolated initialization have both passed.

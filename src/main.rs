@@ -127,6 +127,11 @@ struct Args {
 
     #[arg(long, default_value_t = 200)]
     conn_burst: u32,
+
+    /// Concurrent connections per listener. Separate from the request rate
+    /// limit so idle keep-alive connections cannot starve health probes.
+    #[arg(long, env = "SERVER_MAX_CONNECTIONS", default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
 }
 
 #[tokio::main]
@@ -175,7 +180,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(wait_for_shutdown_signal(shutdown_tx));
     let http_addr = bind_addr(&args.bind_address, args.http_port, "HTTP")?;
-    let conn_limit = args.conn_burst as usize;
+    let conn_limit = args.max_connections as usize;
 
     if args.enable_tls {
         if !args.tls_auto_cert_domains.is_empty()
@@ -631,6 +636,20 @@ mod tests {
         assert_eq!(args.metadata_ttl_seconds, 1800);
         assert_eq!(args.outbound_mode, OutboundMode::Direct);
         assert_eq!(args.https_redirect_port, None);
+        assert_eq!(args.max_connections, 4096);
+        assert_eq!(args.conn_burst, 200);
+    }
+
+    #[test]
+    fn cli_rejects_zero_max_connections() {
+        assert!(
+            Args::try_parse_from([
+                "open-tf-mirror",
+                "--enable-tls=false",
+                "--max-connections=0"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
