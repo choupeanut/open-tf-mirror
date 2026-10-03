@@ -64,10 +64,21 @@ impl ReloadingCertResolver {
         let now_epoch = unix_timestamp(SystemTime::now());
         {
             let cached = self.cached_key.read();
-            if now_epoch < cached.0.not_after && now.duration_since(cached.1) < self.reload_interval
-            {
-                return Some(Arc::clone(&cached.0.key));
+            if now.duration_since(cached.1) < self.reload_interval {
+                // Within the interval: serve the cache while valid, otherwise
+                // return `None` without touching the files (throttled retry).
+                return (now_epoch <= cached.0.not_after).then(|| Arc::clone(&cached.0.key));
             }
+        }
+
+        // Claim the reload under the write lock so concurrent handshakes that
+        // cross the interval together do not all hit the filesystem.
+        {
+            let mut cached = self.cached_key.write();
+            if now.duration_since(cached.1) < self.reload_interval {
+                return (now_epoch <= cached.0.not_after).then(|| Arc::clone(&cached.0.key));
+            }
+            cached.1 = now;
         }
 
         match self.load_certified_key() {
@@ -83,21 +94,21 @@ impl ReloadingCertResolver {
                 Some(key)
             }
             Err(err) => {
-                tracing::warn!(
-                    cert_path = %self.cert_path.display(),
-                    key_path = %self.key_path.display(),
-                    error = %err,
-                    "failed to reload TLS certificate, falling back to cached certificate"
-                );
-                let mut cached = self.cached_key.write();
-                cached.1 = now;
-                if now_epoch < cached.0.not_after {
+                let cached = self.cached_key.read();
+                if now_epoch <= cached.0.not_after {
+                    tracing::warn!(
+                        cert_path = %self.cert_path.display(),
+                        key_path = %self.key_path.display(),
+                        error = %err,
+                        "failed to reload TLS certificate, falling back to cached certificate"
+                    );
                     Some(Arc::clone(&cached.0.key))
                 } else {
                     tracing::error!(
                         cert_path = %self.cert_path.display(),
+                        key_path = %self.key_path.display(),
                         error = %err,
-                        "cached TLS certificate has expired and cannot be used"
+                        "cached TLS certificate has expired and reload failed; retrying after the reload interval"
                     );
                     None
                 }
@@ -131,7 +142,7 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<LoadedCertifi
         bail!("TLS certificate file did not contain a certificate chain");
     }
 
-    let not_after = validate_certificate_validity(&certs)?;
+    let not_after = validate_certificate_validity(&certs, unix_timestamp(SystemTime::now()))?;
 
     let key = PrivateKeyDer::from_pem_file(key_path)
         .with_context(|| format!("parse TLS private key {}", key_path.display()))?;
@@ -154,8 +165,7 @@ fn build_certified_key(
     Ok(certified_key)
 }
 
-fn validate_certificate_validity(certs: &[CertificateDer<'_>]) -> Result<i64> {
-    let now = unix_timestamp(SystemTime::now());
+fn validate_certificate_validity(certs: &[CertificateDer<'_>], now: i64) -> Result<i64> {
     let mut earliest_not_after = i64::MAX;
     for (index, cert) in certs.iter().enumerate() {
         let (not_before, not_after) = parse_certificate_validity(cert.as_ref())
@@ -164,8 +174,9 @@ fn validate_certificate_validity(certs: &[CertificateDer<'_>]) -> Result<i64> {
         if now < not_before {
             bail!("TLS certificate {index} is not valid yet (not_before={not_before}, now={now})");
         }
-        // X.509 `notAfter` is an exclusive upper bound.
-        if now >= not_after {
+        // RFC 5280 section 4.1.2.5: the validity period includes both
+        // `notBefore` and `notAfter`.
+        if now > not_after {
             bail!("TLS certificate {index} has expired (not_after={not_after}, now={now})");
         }
         earliest_not_after = earliest_not_after.min(not_after);
@@ -367,5 +378,116 @@ fn unix_timestamp(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs().min(i64::MAX as u64) as i64,
         Err(error) => -(error.duration().as_secs().min(i64::MAX as u64) as i64),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use rcgen::{CertificateParams, KeyPair, date_time_ymd};
+
+    use super::*;
+
+    const NOT_AFTER_2030: i64 = 1_893_456_000; // 2030-01-01T00:00:00Z
+
+    fn write_pair(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let mut params = CertificateParams::new(vec![format!("{name}.example.test")]).unwrap();
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2030, 1, 1);
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        fs::write(&cert_path, cert.pem()).unwrap();
+        fs::write(&key_path, key.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
+
+    fn der(path: &Path) -> Vec<CertificateDer<'static>> {
+        CertificateDer::pem_file_iter(path)
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn not_after_boundary_is_inclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cert, _) = write_pair(tmp.path(), "a");
+        let certs = der(&cert);
+        let (not_before, not_after) = parse_certificate_validity(certs[0].as_ref()).unwrap();
+        assert_eq!(not_after, NOT_AFTER_2030);
+
+        assert_eq!(
+            validate_certificate_validity(&certs, not_after).unwrap(),
+            not_after
+        );
+        assert!(validate_certificate_validity(&certs, not_after + 1).is_err());
+        assert!(validate_certificate_validity(&certs, not_before).is_ok());
+        assert!(validate_certificate_validity(&certs, not_before - 1).is_err());
+    }
+
+    fn expire_cache(resolver: &ReloadingCertResolver) {
+        resolver.cached_key.write().0.not_after = 0;
+    }
+
+    fn age_cache(resolver: &ReloadingCertResolver) {
+        let mut cached = resolver.cached_key.write();
+        cached.1 = Instant::now()
+            .checked_sub(resolver.reload_interval * 2)
+            .unwrap();
+    }
+
+    #[test]
+    fn expired_cache_retries_at_most_once_per_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (live_cert, live_key) = write_pair(tmp.path(), "live");
+        let (new_cert, new_key) = write_pair(tmp.path(), "new");
+        let resolver = ReloadingCertResolver::new_with_reload_interval(
+            &live_cert,
+            &live_key,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        expire_cache(&resolver);
+
+        // Within the interval nothing is reloaded, even though a valid
+        // replacement is available.
+        fs::copy(&new_cert, &live_cert).unwrap();
+        fs::copy(&new_key, &live_key).unwrap();
+        assert!(resolver.resolve_current_cert_option().is_none());
+        assert!(resolver.resolve_current_cert_option().is_none());
+
+        // After the interval the replacement is picked up.
+        age_cache(&resolver);
+        let key = resolver.resolve_current_cert_option().unwrap();
+        assert_eq!(key.cert[0].as_ref(), der(&new_cert)[0].as_ref());
+    }
+
+    #[test]
+    fn failed_reload_of_expired_cache_is_throttled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (live_cert, live_key) = write_pair(tmp.path(), "live");
+        let (new_cert, new_key) = write_pair(tmp.path(), "new");
+        let resolver = ReloadingCertResolver::new_with_reload_interval(
+            &live_cert,
+            &live_key,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        expire_cache(&resolver);
+        age_cache(&resolver);
+
+        fs::write(&live_cert, "broken").unwrap();
+        assert!(resolver.resolve_current_cert_option().is_none());
+
+        // The failed attempt consumed this interval: a fixed file is not read yet.
+        fs::copy(&new_cert, &live_cert).unwrap();
+        fs::copy(&new_key, &live_key).unwrap();
+        assert!(resolver.resolve_current_cert_option().is_none());
+
+        age_cache(&resolver);
+        assert!(resolver.resolve_current_cert_option().is_some());
     }
 }

@@ -98,14 +98,19 @@ fn default_complete() -> bool {
     true
 }
 
+// Cache entries are shared behind `Arc` so a cache hit is a refcount bump
+// instead of a deep copy of the whole index (thousands of versions/platforms).
+type IndexEntry = Arc<CacheEntry<Vec<RegistryVersion>>>;
+type VersionEntry = Arc<CacheEntry<VersionMetadata>>;
+
 #[derive(Debug, Clone)]
 pub struct ProviderMetadataService {
     data_dir: Arc<PathBuf>,
     allowed_registries: Arc<HashSet<String>>,
     freshness: Duration,
     registry: RegistryClient,
-    indices: Arc<RwLock<HashMap<ProviderKey, CacheEntry<Vec<RegistryVersion>>>>>,
-    versions: Arc<RwLock<HashMap<VersionKey, CacheEntry<VersionMetadata>>>>,
+    indices: Arc<RwLock<HashMap<ProviderKey, IndexEntry>>>,
+    versions: Arc<RwLock<HashMap<VersionKey, VersionEntry>>>,
     index_locks: KeyLockMap<ProviderKey>,
     version_locks: KeyLockMap<VersionKey>,
     index_failures: Arc<RwLock<HashMap<ProviderKey, Instant>>>,
@@ -194,18 +199,20 @@ impl ProviderMetadataService {
         };
         self.versions.write().insert(
             key,
-            CacheEntry {
+            Arc::new(CacheEntry {
                 fetched_at: now_epoch(),
                 complete: true,
                 value: version.clone(),
-            },
+            }),
         );
         let mut indices = self.indices.write();
-        let entry = indices.entry(provider).or_insert_with(|| CacheEntry {
-            fetched_at: now_epoch(),
-            complete: true,
-            value: Vec::new(),
-        });
+        let entry = Arc::make_mut(indices.entry(provider).or_insert_with(|| {
+            Arc::new(CacheEntry {
+                fetched_at: now_epoch(),
+                complete: true,
+                value: Vec::new(),
+            })
+        }));
         if !entry
             .value
             .iter()
@@ -235,10 +242,12 @@ impl ProviderMetadataService {
         let entry = self.load_index(&key).await?;
         let mut versions = entry
             .value
+            .iter()
+            .map(|item| normalize_version(&item.version))
+            .collect::<HashSet<_>>()
             .into_iter()
-            .map(|item| item.version)
             .collect::<Vec<_>>();
-        versions.sort();
+        versions.sort_by(|a, b| compare_versions(a, b));
         Ok(versions)
     }
 
@@ -249,6 +258,19 @@ impl ProviderMetadataService {
         provider_type: &str,
         version: &str,
     ) -> Result<Option<VersionMetadata>, MetadataError> {
+        Ok(self
+            .get_version_entry(hostname, namespace, provider_type, version)
+            .await?
+            .map(|entry| entry.value.clone()))
+    }
+
+    async fn get_version_entry(
+        &self,
+        hostname: &str,
+        namespace: &str,
+        provider_type: &str,
+        version: &str,
+    ) -> Result<Option<VersionEntry>, MetadataError> {
         validate_version(version, "version")?;
         let provider = self.provider_key(hostname, namespace, provider_type)?;
         let key = VersionKey {
@@ -256,7 +278,7 @@ impl ProviderMetadataService {
             version: normalize_version(version),
         };
         match self.load_version(&key).await {
-            Ok(value) => Ok(Some(value.value)),
+            Ok(entry) => Ok(Some(entry)),
             Err(MetadataError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -272,13 +294,15 @@ impl ProviderMetadataService {
         let archive = ArchiveName::parse(provider_type, filename)
             .map_err(|_| MetadataError::InvalidAddress("archive filename".into()))?;
         Ok(self
-            .get_version(hostname, namespace, provider_type, &archive.version)
+            .get_version_entry(hostname, namespace, provider_type, &archive.version)
             .await?
-            .and_then(|metadata| {
-                metadata
+            .and_then(|entry| {
+                entry
+                    .value
                     .platforms
-                    .into_iter()
+                    .iter()
                     .find(|item| item.filename == filename)
+                    .cloned()
             }))
     }
 
@@ -374,10 +398,7 @@ impl ProviderMetadataService {
         self.version_failures.write().remove(key);
     }
 
-    async fn load_index(
-        &self,
-        key: &ProviderKey,
-    ) -> Result<CacheEntry<Vec<RegistryVersion>>, MetadataError> {
+    async fn load_index(&self, key: &ProviderKey) -> Result<IndexEntry, MetadataError> {
         if let Some(entry) = self.indices.read().get(key).cloned()
             && entry.fresh(self.freshness, self.refresh_backoff)
         {
@@ -395,7 +416,7 @@ impl ProviderMetadataService {
                 read_json::<CacheEntry<Vec<RegistryVersion>>>(&self.index_path(key)).await?
         {
             if validate_registry_versions(&entry.value).is_ok() {
-                self.indices.write().insert(key.clone(), entry);
+                self.indices.write().insert(key.clone(), Arc::new(entry));
             } else {
                 tracing::warn!(
                     path = %self.index_path(key).display(),
@@ -428,30 +449,24 @@ impl ProviderMetadataService {
         }
     }
 
-    async fn refresh_index_unlocked(
-        &self,
-        key: &ProviderKey,
-    ) -> Result<CacheEntry<Vec<RegistryVersion>>, MetadataError> {
+    async fn refresh_index_unlocked(&self, key: &ProviderKey) -> Result<IndexEntry, MetadataError> {
         let versions = self
             .registry
             .versions(&key.hostname, &key.namespace, &key.provider_type)
             .await
             .map_err(map_registry)?;
         validate_registry_versions(&versions)?;
-        let entry = CacheEntry {
+        let entry = Arc::new(CacheEntry {
             fetched_at: now_epoch(),
             complete: true,
             value: versions,
-        };
-        write_json_atomic(&self.index_path(key), &entry).await?;
-        self.indices.write().insert(key.clone(), entry.clone());
+        });
+        write_json_atomic(&self.index_path(key), &*entry).await?;
+        self.indices.write().insert(key.clone(), Arc::clone(&entry));
         Ok(entry)
     }
 
-    async fn load_version(
-        &self,
-        key: &VersionKey,
-    ) -> Result<CacheEntry<VersionMetadata>, MetadataError> {
+    async fn load_version(&self, key: &VersionKey) -> Result<VersionEntry, MetadataError> {
         if let Some(entry) = self.versions.read().get(key).cloned()
             && entry.fresh(self.freshness, self.refresh_backoff)
         {
@@ -469,7 +484,7 @@ impl ProviderMetadataService {
                 read_json::<CacheEntry<VersionMetadata>>(&self.version_path(key)).await?
         {
             if validate_version_metadata(key, &entry.value).is_ok() {
-                self.versions.write().insert(key.clone(), entry);
+                self.versions.write().insert(key.clone(), Arc::new(entry));
             } else {
                 tracing::warn!(
                     path = %self.version_path(key).display(),
@@ -502,10 +517,7 @@ impl ProviderMetadataService {
         }
     }
 
-    async fn refresh_version(
-        &self,
-        key: &VersionKey,
-    ) -> Result<CacheEntry<VersionMetadata>, MetadataError> {
+    async fn refresh_version(&self, key: &VersionKey) -> Result<VersionEntry, MetadataError> {
         let mut index = self.load_index(&key.provider).await?;
         if !index
             .value
@@ -633,13 +645,15 @@ impl ProviderMetadataService {
             version: key.version.clone(),
             platforms,
         };
-        let entry = CacheEntry {
+        let entry = Arc::new(CacheEntry {
             fetched_at: now_epoch(),
             complete,
             value,
-        };
-        write_json_atomic(&self.version_path(key), &entry).await?;
-        self.versions.write().insert(key.clone(), entry.clone());
+        });
+        write_json_atomic(&self.version_path(key), &*entry).await?;
+        self.versions
+            .write()
+            .insert(key.clone(), Arc::clone(&entry));
         Ok(entry)
     }
 
@@ -661,7 +675,7 @@ impl ProviderMetadataService {
 fn discover_indices(
     root: &Path,
     allowed_registries: &HashSet<String>,
-) -> Result<HashMap<ProviderKey, CacheEntry<Vec<RegistryVersion>>>, MetadataError> {
+) -> Result<HashMap<ProviderKey, IndexEntry>, MetadataError> {
     let mut indices = HashMap::new();
     let hostnames = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -717,7 +731,7 @@ fn discover_indices(
                         namespace: namespace.clone(),
                         provider_type,
                     },
-                    entry,
+                    Arc::new(entry),
                 );
             }
         }
@@ -754,6 +768,17 @@ fn lock_for<K: Eq + std::hash::Hash + Clone>(locks: &KeyLockMap<K>, key: K) -> M
         locks: Arc::clone(locks),
         key,
         mutex,
+    }
+}
+
+/// Orders versions by semver precedence; unparseable strings sort after
+/// parseable ones, in plain string order.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
     }
 }
 

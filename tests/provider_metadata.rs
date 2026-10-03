@@ -1132,3 +1132,39 @@ async fn invalid_upstream_platform_is_rejected_before_persistence() {
             .exists()
     );
 }
+
+#[tokio::test]
+async fn list_versions_normalizes_prefix_deduplicates_and_sorts_by_semver() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let platforms = serde_json::json!([{"os": "linux", "arch": "amd64"}]);
+    mount_index_and_packages(
+        &server,
+        serde_json::json!({
+            "versions": [
+                {"version": "v1.10.0", "platforms": platforms},
+                {"version": "1.2.0", "platforms": platforms},
+                {"version": "1.10.0", "platforms": platforms},
+                {"version": "v1.2.0", "platforms": platforms},
+                {"version": "1.9.0-rc.1", "platforms": platforms},
+                {"version": "1.9.0", "platforms": platforms}
+            ]
+        }),
+        Vec::<&str>::new(),
+    )
+    .await;
+    let service = ProviderMetadataService::with_registry_client(
+        temp.path(),
+        ["registry.terraform.io"],
+        Duration::from_secs(1800),
+        client(&server),
+    )
+    .unwrap();
+
+    let versions = service
+        .list_versions("registry.terraform.io", "hashicorp", "random")
+        .await
+        .unwrap();
+
+    assert_eq!(versions, ["1.2.0", "1.9.0-rc.1", "1.9.0", "1.10.0"]);
+}
