@@ -262,7 +262,7 @@ jobs:
             --set openTfMirror.tls.domainName=it-will-be-ignored.example.com \
             --set openTfMirror.tls.secretName=open-tf-mirror-tls-secret \
             --set openTfMirror.pvc.size=20Gi \
-            --set openTfMirror.pvc.storageClass=hyperdisk-balanced \
+            --set openTfMirror.pvc.storageClass=standard \
             >/tmp/open-tf-mirror-rendered.yaml
           grep -q 'name: open-tf-mirror$' /tmp/open-tf-mirror-rendered.yaml
           grep -q 'name: open-tf-mirror-headless$' /tmp/open-tf-mirror-rendered.yaml

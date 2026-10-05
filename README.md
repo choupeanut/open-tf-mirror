@@ -3,8 +3,7 @@
 `open-tf-mirror` is a persistent, on-demand Terraform/OpenTofu provider
 [network mirror](https://developer.hashicorp.com/terraform/internals/provider-network-mirror-protocol)
 written in Rust. It replaces the [HermitCrab](https://github.com/seal-io/hermitcrab)
-deployment used in Pricer's infrastructure workflows. It keeps the same URL shape
-and Helm values, and fixes the HermitCrab problems listed below.
+deployment, keeps the same URL shape and Helm values, and fixes the HermitCrab
 
 ## Why not HermitCrab
 
@@ -176,9 +175,6 @@ Terraform, `openssl`, `curl`, `jq` and `socat`.
 - [Changelog](CHANGELOG.md)
 - [0.3.0 architecture review and plan](docs/reviews/2026-10-03-architecture-review.md)
 - [HermitCrab upstream comparison](docs/reviews/2026-09-06-hermitcrab-upstream-comparison.md)
-- Consumer migration runbooks:
-  [`cloud-infra-argocd-apps`](docs/migration/cloud-infra-argocd-apps.md),
-  [`cloud-infra-terragrunt-terraform`](docs/migration/cloud-infra-terragrunt-terraform.md)
 
 ## License
 
