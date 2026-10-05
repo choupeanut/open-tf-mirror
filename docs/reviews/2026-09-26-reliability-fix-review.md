@@ -1,8 +1,6 @@
 # 0.2.1 Reliability Review
 
 This release implements the scoped P1/P2 corrections for `open-tf-mirror`.
-The consumer repositories remain unchanged; their rollout direction is in the
-migration runbooks.
 
 ## Finding Mapping
 
@@ -57,7 +55,7 @@ Clippy, 81 tests, dependency audit, Helm lint/render, Docker build using Rust
 1.88, and Terraform online installation followed by a restarted mirror on an
 internal Docker network. Removing the cached archive then correctly failed
 installation without leaving a temporary archive. The three independent review
-probes also pass. Consumer repositories and deployments were not changed.
+probes also pass.
 
 This evidence does not cover proxy-only/NO_PROXY and custom-CA handshake fixtures
 or HTTP/2 GOAWAY and slow in-flight transfer shutdown tests; those remain test

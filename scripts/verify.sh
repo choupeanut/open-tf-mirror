@@ -24,12 +24,12 @@ helm template open-tf-mirror charts/open-tf-mirror \
   --set openTfMirror.tls.enabled=true \
   --set openTfMirror.tls.secretName=open-tf-mirror-tls-secret \
   --set openTfMirror.pvc.size=20Gi \
-  --set openTfMirror.pvc.storageClass=hyperdisk-balanced \
-  >/tmp/open-tf-mirror-pricer.yaml
+  --set openTfMirror.pvc.storageClass=standard \
+  >/tmp/open-tf-mirror-custom.yaml
 
 if command -v kubeconform >/dev/null 2>&1; then
   kubeconform -strict /tmp/open-tf-mirror-default.yaml
-  kubeconform -strict /tmp/open-tf-mirror-pricer.yaml
+  kubeconform -strict /tmp/open-tf-mirror-custom.yaml
 fi
 
 if [[ "${SKIP_DOCKER:-0}" != 1 ]]; then

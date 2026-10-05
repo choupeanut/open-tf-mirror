@@ -74,7 +74,7 @@ module mirror 預設仍關閉。啟用時現在有 module id/path traversal vali
 - CI 不再硬編碼 image tag `0.2.0`，而是由 chart values 讀取；release 版本仍會比對 Cargo、Chart、appVersion 與 image tag。
 - CI 增加 PDB zero/互斥、imagePullSecrets、long name、custom target port、duplicate TLS argument 的 render assertions。
 - [scripts/verify.sh](../../scripts/verify.sh) 的 E2E 現在隔離 `TF_PLUGIN_CACHE_DIR`，第一次 online init 後清空 Terraform cache，再以 Docker `--internal` network、host-to-container forwarder 驗證第二次 cache hit；刪除 archive 並把 persisted metadata URL 改成 `127.0.0.1:1` 時，第三次 init 必須失敗且不得留下 partial archive。
-- README、chart README、consumer migration runbook 與 license 連結已補齊。
+- README、chart README 與 license 連結已補齊。
 
 ## 尚未關閉的風險與建議
 
@@ -128,4 +128,4 @@ OPEN_TF_MIRROR_TEST_HTTP_PORT=28080 OPEN_TF_MIRROR_TEST_HTTPS_PORT=28443 RUN_E2E
 2. 讓 cert-manager 產生/更新 Secret，確認新 fingerprint 被採用，並故意放入 expired/mismatched pair，確認服務保留 last-good 或拒絕 handshake。
 3. 以 `terraform init -lockfile=readonly` 驗證代表性 provider，刪除 runner 的 `.terraform` 與 plugin cache 後再次驗證 PVC cache hit。
 4. 觀察 PVC usage、metadata refresh error、archive checksum failure、pod restart 與上游 latency；確認 NetworkPolicy 限制 `/v1/providers/sync` 與 HTTP port 的來源。
-5. 保留舊版本 chart/image 與 PVC，完成 rollback rehearsal 後才切換 consumer repository。
+5. 保留舊版本 chart/image 與 PVC，完成 rollback rehearsal 後才切換。
