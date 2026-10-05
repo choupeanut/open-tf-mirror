@@ -4,6 +4,7 @@
 [network mirror](https://developer.hashicorp.com/terraform/internals/provider-network-mirror-protocol)
 written in Rust. It replaces the [HermitCrab](https://github.com/seal-io/hermitcrab)
 deployment, keeps the same URL shape and Helm values, and fixes the HermitCrab
+problems listed below.
 
 ## Why not HermitCrab
 
